@@ -1,1 +1,18 @@
+# バックエンド
+backend/node_modules/
+backend/.env
 
+# フロントエンド
+frontend/node_modules/
+
+# OSのゴミ
+.DS_Store
+Thumbs.db
+
+# エディタ設定
+.vscode/
+.idea/
+
+# ログ
+*.log
+npm-debug.log*
