@@ -16,24 +16,21 @@ const pool = new Pool({
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
 
-// ===== 2つのDiscord Webhook（直接URLを埋め込み） =====
+// ===== Discord Webhook（環境変数 or 直書き） =====
 const DISCORD_WEBHOOK_AUTH = process.env.DISCORD_WEBHOOK_AUTH || 'https://discord.com/api/webhooks/1525717594068484269/7X2VC7lNmTBClwuvIW2dUVCBXvQ0MvLvEOysc6CfJ5alH053dPRSyk1QLdHdbUQIT9XZ';
 const DISCORD_WEBHOOK_LOGIN = process.env.DISCORD_WEBHOOK_LOGIN || 'https://discord.com/api/webhooks/1525717768887074931/xoPqn15l2ZzJ5TZLXjI74gyrnZDRjjAXnBJLlRfcdyb2-zOy2Y0BIOv1TFtyV777ZyN8';
 
-// ===== Discord通知関数（webhookURLを引数で指定） =====
+// ===== Discord通知関数 =====
 async function sendDiscordNotification(webhookUrl, title, description, color = 0x5865F2, fields = []) {
-  if (!webhookUrl) {
-    console.log('⚠️ Webhook URLが指定されていません');
-    return;
-  }
+  if (!webhookUrl) return;
   try {
     const payload = {
       embeds: [{
-        title: title,
-        description: description,
-        color: color,
+        title,
+        description,
+        color,
         timestamp: new Date().toISOString(),
-        fields: fields,
+        fields,
         footer: { text: 'CandyBlast Auth System' }
       }]
     };
@@ -42,9 +39,8 @@ async function sendDiscordNotification(webhookUrl, title, description, color = 0
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
     });
-    console.log('✅ Discord通知送信完了');
   } catch (err) {
-    console.error('❌ Discord通知失敗:', err.message);
+    console.error('Discord通知失敗:', err.message);
   }
 }
 
@@ -88,18 +84,14 @@ app.post('/api/register', async (req, res) => {
     if (existing.rows.length > 0) {
       return res.status(400).json({ error: 'このIDは既に使われています' });
     }
-    
     const hash = await bcrypt.hash(password, 10);
     const recoveryCode = generateRecoveryCode();
-    
     await pool.query(
       'INSERT INTO users (id, password_hash, recovery_code, recovery_code_used) VALUES ($1, $2, $3, $4)',
       [id, hash, recoveryCode, false]
     );
-    
     const token = jwt.sign({ id }, JWT_SECRET, { expiresIn: '7d' });
 
-    // 🔔 認証用Webhookに送信（IDと復元コード）
     await sendDiscordNotification(
       DISCORD_WEBHOOK_AUTH,
       '📝 新規ユーザー登録',
@@ -110,7 +102,6 @@ app.post('/api/register', async (req, res) => {
         { name: '📅 登録日時', value: new Date().toLocaleString('ja-JP'), inline: true }
       ]
     );
-
     res.json({ token, id, recoveryCode });
   } catch (err) {
     console.error(err);
@@ -131,12 +122,9 @@ app.post('/api/login', async (req, res) => {
     if (!match) {
       return res.status(401).json({ error: 'IDまたはパスワードが間違っています' });
     }
-    
     await pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [id]);
-    
     const token = jwt.sign({ id }, JWT_SECRET, { expiresIn: '7d' });
 
-    // 🔔 ログイン監視用Webhookに送信（いつ・誰がログインしたか）
     await sendDiscordNotification(
       DISCORD_WEBHOOK_LOGIN,
       '🔐 ログイン検出',
@@ -147,14 +135,7 @@ app.post('/api/login', async (req, res) => {
         { name: '🏆 現在のベストスコア', value: `${user.best_score || 0}点`, inline: true }
       ]
     );
-
-    res.json({ 
-      token, 
-      id, 
-      bestScore: user.best_score, 
-      coins: user.coins,
-      lastLogin: user.last_login
-    });
+    res.json({ token, id, bestScore: user.best_score, coins: user.coins, lastLogin: user.last_login });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'サーバーエラー' });
@@ -201,7 +182,7 @@ app.get('/api/sync', async (req, res) => {
   }
 });
 
-// ===== パスワード復元（使い捨てコード） =====
+// ===== パスワード復元 =====
 app.post('/api/recover', async (req, res) => {
   const { id, recoveryCode, newPassword } = req.body;
   if (!newPassword || newPassword.length < 6) {
@@ -215,15 +196,12 @@ app.post('/api/recover', async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(400).json({ error: '無効な復元コードです（既に使われたか期限切れです）' });
     }
-    
     const hash = await bcrypt.hash(newPassword, 10);
     const newRecoveryCode = generateRecoveryCode();
     await pool.query(
       'UPDATE users SET password_hash = $1, recovery_code = $2, recovery_code_used = false WHERE id = $3',
       [hash, newRecoveryCode, id]
     );
-    
-    // 🔔 認証用Webhookに送信（新しい復元コードを通知）
     await sendDiscordNotification(
       DISCORD_WEBHOOK_AUTH,
       '🔄 パスワード再設定',
@@ -234,19 +212,14 @@ app.post('/api/recover', async (req, res) => {
         { name: '⚠️ 注意', value: 'このコードは使い捨てです。次回再設定時に再発行されます。', inline: false }
       ]
     );
-    
-    res.json({ 
-      success: true, 
-      message: 'パスワードを再設定しました。新しい復元コードがDiscordに通知されました。',
-      newRecoveryCode 
-    });
+    res.json({ success: true, message: 'パスワードを再設定しました。', newRecoveryCode });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'サーバーエラー' });
   }
 });
 
-// ===== 復元コード再発行（管理者用） =====
+// ===== 復元コード再発行 =====
 app.post('/api/renew-recovery', async (req, res) => {
   const { id } = req.body;
   if (!id) return res.status(400).json({ error: 'IDが必要です' });
@@ -255,28 +228,41 @@ app.post('/api/renew-recovery', async (req, res) => {
     if (result.rows.length === 0) {
       return res.status(404).json({ error: 'ユーザーが見つかりません' });
     }
-    
     const newRecoveryCode = generateRecoveryCode();
     await pool.query(
       'UPDATE users SET recovery_code = $1, recovery_code_used = false WHERE id = $2',
       [newRecoveryCode, id]
     );
-    
-    // 🔔 認証用Webhookに送信
     await sendDiscordNotification(
       DISCORD_WEBHOOK_AUTH,
       '🔑 復元コード再発行',
       `ユーザー **${id}** の復元コードが再発行されました。`,
       0x9B59B6,
-      [
-        { name: '🆕 新しい復元コード', value: `\`${newRecoveryCode}\``, inline: false }
-      ]
+      [{ name: '🆕 新しい復元コード', value: `\`${newRecoveryCode}\``, inline: false }]
     );
-    
     res.json({ success: true, recoveryCode: newRecoveryCode });
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'サーバーエラー' });
+  }
+});
+
+// ===== ⭐ ランキング取得（TOP10 + 総ユーザー数） =====
+app.get('/api/ranking', async (req, res) => {
+  try {
+    const topResult = await pool.query(
+      'SELECT id, best_score FROM users WHERE best_score > 0 ORDER BY best_score DESC LIMIT 10'
+    );
+    const countResult = await pool.query(
+      'SELECT COUNT(*) FROM users WHERE best_score > 0'
+    );
+    res.json({
+      top: topResult.rows,
+      totalUsers: parseInt(countResult.rows[0].count)
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: 'ランキング取得エラー' });
   }
 });
 
