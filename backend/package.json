@@ -1,7 +1,7 @@
 {
   "name": "candyblast-server",
   "version": "1.0.0",
-  "description": "CandyBlast Auth Server with Discord Webhook",
+  "description": "CandyBlast 認証サーバー + Discord通知 + ランキング",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
