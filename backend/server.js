@@ -15,12 +15,15 @@ const pool = new Pool({
 });
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
-const DISCORD_WEBHOOK_URL = process.env.DISCORD_WEBHOOK_URL; // 環境変数に設定！
 
-// ===== Discord通知関数 =====
-async function sendDiscordNotification(title, description, color = 0x5865F2, fields = []) {
-  if (!DISCORD_WEBHOOK_URL) {
-    console.log('⚠️ DISCORD_WEBHOOK_URLが設定されていません');
+// ===== 2つのDiscord Webhook（直接URLを埋め込み） =====
+const DISCORD_WEBHOOK_AUTH = process.env.DISCORD_WEBHOOK_AUTH || 'https://discord.com/api/webhooks/1525717594068484269/7X2VC7lNmTBClwuvIW2dUVCBXvQ0MvLvEOysc6CfJ5alH053dPRSyk1QLdHdbUQIT9XZ';
+const DISCORD_WEBHOOK_LOGIN = process.env.DISCORD_WEBHOOK_LOGIN || 'https://discord.com/api/webhooks/1525717768887074931/xoPqn15l2ZzJ5TZLXjI74gyrnZDRjjAXnBJLlRfcdyb2-zOy2Y0BIOv1TFtyV777ZyN8';
+
+// ===== Discord通知関数（webhookURLを引数で指定） =====
+async function sendDiscordNotification(webhookUrl, title, description, color = 0x5865F2, fields = []) {
+  if (!webhookUrl) {
+    console.log('⚠️ Webhook URLが指定されていません');
     return;
   }
   try {
@@ -34,7 +37,7 @@ async function sendDiscordNotification(title, description, color = 0x5865F2, fie
         footer: { text: 'CandyBlast Auth System' }
       }]
     };
-    await fetch(DISCORD_WEBHOOK_URL, {
+    await fetch(webhookUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
@@ -62,13 +65,13 @@ pool.query(`
   );
 `);
 
-// ===== 復元コード生成（使い捨て） =====
+// ===== 復元コード生成 =====
 function generateRecoveryCode() {
   const parts = [];
   for (let i = 0; i < 4; i++) {
     parts.push(Math.random().toString(36).slice(2, 6).toUpperCase());
   }
-  return parts.join('-'); // 例: "XK9P-2MNR-7WQD-4FBT"
+  return parts.join('-');
 }
 
 // ===== ユーザー登録 =====
@@ -96,11 +99,12 @@ app.post('/api/register', async (req, res) => {
     
     const token = jwt.sign({ id }, JWT_SECRET, { expiresIn: '7d' });
 
-    // 🔔 Discord通知（新規登録）
+    // 🔔 認証用Webhookに送信（IDと復元コード）
     await sendDiscordNotification(
+      DISCORD_WEBHOOK_AUTH,
       '📝 新規ユーザー登録',
       `ユーザー **${id}** が新規登録しました！`,
-      0x00FF00, // 緑
+      0x00FF00,
       [
         { name: '🔑 復元コード', value: `\`${recoveryCode}\``, inline: false },
         { name: '📅 登録日時', value: new Date().toLocaleString('ja-JP'), inline: true }
@@ -128,16 +132,16 @@ app.post('/api/login', async (req, res) => {
       return res.status(401).json({ error: 'IDまたはパスワードが間違っています' });
     }
     
-    // 最終ログイン日時を更新
     await pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [id]);
     
     const token = jwt.sign({ id }, JWT_SECRET, { expiresIn: '7d' });
 
-    // 🔔 Discord通知（ログイン）
+    // 🔔 ログイン監視用Webhookに送信（いつ・誰がログインしたか）
     await sendDiscordNotification(
-      '🔐 ログイン通知',
+      DISCORD_WEBHOOK_LOGIN,
+      '🔐 ログイン検出',
       `ユーザー **${id}** がログインしました。`,
-      0x5865F2, // 青
+      0x5865F2,
       [
         { name: '🕐 ログイン日時', value: new Date().toLocaleString('ja-JP'), inline: true },
         { name: '🏆 現在のベストスコア', value: `${user.best_score || 0}点`, inline: true }
@@ -213,19 +217,18 @@ app.post('/api/recover', async (req, res) => {
     }
     
     const hash = await bcrypt.hash(newPassword, 10);
-    
-    // パスワード更新 + 復元コードを使い捨てに（再発行）
     const newRecoveryCode = generateRecoveryCode();
     await pool.query(
       'UPDATE users SET password_hash = $1, recovery_code = $2, recovery_code_used = false WHERE id = $3',
       [hash, newRecoveryCode, id]
     );
     
-    // 🔔 Discord通知（パスワード再設定）
+    // 🔔 認証用Webhookに送信（新しい復元コードを通知）
     await sendDiscordNotification(
+      DISCORD_WEBHOOK_AUTH,
       '🔄 パスワード再設定',
       `ユーザー **${id}** のパスワードが再設定されました。`,
-      0xFFA500, // オレンジ
+      0xFFA500,
       [
         { name: '🆕 新しい復元コード', value: `\`${newRecoveryCode}\``, inline: false },
         { name: '⚠️ 注意', value: 'このコードは使い捨てです。次回再設定時に再発行されます。', inline: false }
@@ -243,7 +246,7 @@ app.post('/api/recover', async (req, res) => {
   }
 });
 
-// ===== 復元コード再発行（管理者用・ユーザー用） =====
+// ===== 復元コード再発行（管理者用） =====
 app.post('/api/renew-recovery', async (req, res) => {
   const { id } = req.body;
   if (!id) return res.status(400).json({ error: 'IDが必要です' });
@@ -259,11 +262,12 @@ app.post('/api/renew-recovery', async (req, res) => {
       [newRecoveryCode, id]
     );
     
-    // 🔔 Discord通知（復元コード再発行）
+    // 🔔 認証用Webhookに送信
     await sendDiscordNotification(
+      DISCORD_WEBHOOK_AUTH,
       '🔑 復元コード再発行',
       `ユーザー **${id}** の復元コードが再発行されました。`,
-      0x9B59B6, // 紫
+      0x9B59B6,
       [
         { name: '🆕 新しい復元コード', value: `\`${newRecoveryCode}\``, inline: false }
       ]
