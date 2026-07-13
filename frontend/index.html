@@ -153,6 +153,8 @@
       <div class="icon-btn" id="settingsBtn" title="モード・スキン設定">⚙️</div>
       <div class="icon-btn" id="soundBtn">🔊</div>
       <div class="icon-btn" id="accountBtn">👤</div>
+      <!-- ⭐ ランキングボタン追加 -->
+      <div class="icon-btn" id="rankingBtn" title="ランキング">🏆</div>
     </div>
   </header>
 
@@ -172,18 +174,18 @@
 
 <div id="ghost" style="display:none;"></div>
 
-<!-- 火事がオーバー -->
+<!-- ゲームオーバー -->
 <div id="overlay">
   <div class="panel-box">
-    <h2>火事がオーバー</h2>
+    <h2>🔥 ゲームオーバー</h2>
     <div class="final-score" id="finalScore">0</div>
-    <div class="sub" id="newBestNote">おつにだ</div>
+    <div class="sub" id="newBestNote">お疲れさまでした！</div>
     <div class="sub" id="coinEarnedNote" style="color:var(--gold); font-weight:700;"></div>
-    <button class="primary-btn" id="restartBtn">わんもあ？</button>
+    <button class="primary-btn" id="restartBtn">もう一度</button>
   </div>
 </div>
 
-<!-- 汎用モーダル(アカウント / クエスト) -->
+<!-- 汎用モーダル -->
 <div id="modalOverlay">
   <div class="panel-box" id="modalBox" style="position:relative;">
     <button class="close-x" id="modalClose">×</button>
@@ -193,13 +195,8 @@
 
 <script>
 (function(){
-  // ===================== 設定 (v2.1) =====================
-  // v2.1のサーバーはDiscord通知チャンネルを登録用/ログイン監視用に分離していますが、
-  // これはサーバー内部の挙動なのでクライアント側のAPI呼び出し方法に変更はありません。
-  // ↓ サーバーを立てたら自分のURLに書き換えてください
-  //   ローカル: http://localhost:3000
-  //   Render.comにデプロイした場合の例: https://candyblast-server.onrender.com
-  const API_BASE_URL = 'http://localhost:3000';
+  // ===================== 設定 =====================
+  const API_BASE_URL = 'http://localhost:3000'; // デプロイ後に変更
 
   let SIZE = 8;
   const COLORS = [
@@ -221,8 +218,6 @@
   };
   let currentMode = 'baked';
 
-  // ===================== コイン倍率(難易度が高いほど・盤面が小さいほど多くもらえる) =====================
-  // 焼成(baked) × 8×8 を基準の1倍とする
   const MODE_COIN_MULT = { soft:0.5, baked:1.0, hard:1.5, extreme:3.0 };
   function sizeCoinMult(size){ return 8 / size; }
   function coinMultiplier(mode, size){
@@ -336,6 +331,7 @@
   const settingsBtn = document.getElementById('settingsBtn');
   const modeBadgeEl = document.getElementById('modeBadge');
   const accountBtn = document.getElementById('accountBtn');
+  const rankingBtn = document.getElementById('rankingBtn'); // ⭐追加
   const modalOverlay = document.getElementById('modalOverlay');
   const modalContent = document.getElementById('modalContent');
   const modalClose = document.getElementById('modalClose');
@@ -345,17 +341,13 @@
   let soundOn = true;
   let dragState = null;
 
-  // 本日の統計(デイリークエスト用)
   const DAILY_STATS_DEFAULT = { linesCleared:0, piecesPlaced:0, combos:0, gamesPlayed:0, scoreEarned:0,
     bestSingleGameScore:0, tripleClearCount:0, maxComboStreak:0, hardModeGamesPlayed:0, maxNoClearStreak:0, bigPiecesPlaced:0 };
   let dailyStats = { date:'', ...DAILY_STATS_DEFAULT };
-  let quests = []; // [{id, desc, statKey, target, reward, claimed}]
+  let quests = [];
 
-  // 設定画面の一時選択状態(確定するまでは実際のモードに反映しない)
   let pendingMode = currentMode, pendingSize = SIZE;
-
-  // アカウント状態
-  let authToken = null; // メモリ上のみ保持(サーバー用JWT)
+  let authToken = null;
   let currentUserId = null;
 
   const STORAGE_BEST = 'candyblast-highscore';
@@ -392,7 +384,6 @@
     if(m) modeBadgeEl.textContent = `${m.emoji} ${m.label} · ${SIZE}×${SIZE}`;
   }
 
-  // 選ばれたモード・サイズを実際に反映してゲームを最初からやり直す
   function applyMode(mode, size){
     currentMode = MODES[mode] ? mode : 'baked';
     SIZE = (currentMode==='extreme') ? 8 : Math.min(18, Math.max(5, size||8));
@@ -409,15 +400,12 @@
     return { shape, colorIdx: Math.floor(Math.random()*COLORS.length), used:false };
   }
 
-  // ===================== 接待プログラム(空きスペース逆算) =====================
-  // 盤面の空きセルを数えて、どのくらい埋まっているか(0=空っぽ, 1=満杯)を返す
   function boardFullnessRatio(){
     let filled = 0;
     for(let i=0;i<board.length;i++) if(board[i].filled) filled++;
     return filled / board.length;
   }
 
-  // その形が盤面に何箇所置けるか(多いほど「置きやすい」形)
   function countValidPlacements(shape){
     let count = 0;
     for(let r=0;r<SIZE;r++){
@@ -428,27 +416,20 @@
     return count;
   }
 
-  // 盤面の埋まり具合に応じて、置きやすい形ほど選ばれやすくする重み付き抽選
-  // aggressive=true (柔らかいモード)は早い段階から強めにバイアスをかける
   function pickAdaptiveShape(aggressive){
     const fullness = boardFullnessRatio();
     const threshold = aggressive ? 0.12 : 0.4;
     const maxBias = aggressive ? 6.0 : 3.2;
     const biasPower = fullness < threshold ? (aggressive ? 1.4 : 0) : ((fullness - threshold) / (1 - threshold)) * maxBias;
-
-    if(biasPower <= 0){
-      return SHAPES[Math.floor(Math.random()*SHAPES.length)];
-    }
-
+    if(biasPower <= 0) return SHAPES[Math.floor(Math.random()*SHAPES.length)];
     let totalWeight = 0;
     const weights = SHAPES.map(shape=>{
       const validCount = countValidPlacements(shape);
-      const sizeBonus = 1 / shape.length; // 小さい形を少しだけ優遇
+      const sizeBonus = 1 / shape.length;
       const weight = Math.pow(validCount + 0.05, biasPower) * (1 + sizeBonus);
       totalWeight += weight;
       return weight;
     });
-
     let r = Math.random() * totalWeight;
     for(let i=0;i<SHAPES.length;i++){
       r -= weights[i];
@@ -457,7 +438,6 @@
     return SHAPES[SHAPES.length-1];
   }
 
-  // 激硬モード用: 完全ランダムだが、マス数の多い(大きい)形ほど出やすい重み付き抽選
   function pickWeightedBigShape(){
     let totalWeight = 0;
     const weights = SHAPES.map(shape=>{
@@ -473,21 +453,15 @@
     return SHAPES[SHAPES.length-1];
   }
 
-  // 現在のゲームモードに応じてブロックの形を1つ選ぶ
   function pickShapeForMode(){
     if(currentMode==='soft') return pickAdaptiveShape(true);
     if(currentMode==='hard') return SHAPES[Math.floor(Math.random()*SHAPES.length)];
     if(currentMode==='extreme') return pickWeightedBigShape();
-    return pickAdaptiveShape(false); // baked(焼成)
+    return pickAdaptiveShape(false);
   }
 
-  // モードごとの詰み防止(接待)処理
-  // soft: トレイ全部が置けるように保証してほぼ終わらないようにする
-  // baked: 従来通り、少なくとも1つは置けるように保証する
-  // hard/extreme: 接待なし。完全に詰んだら本当にゲームオーバーになる
   function ensurePlayable(){
     if(currentMode==='hard' || currentMode==='extreme') return;
-
     if(currentMode==='soft'){
       tray.forEach((p,i)=>{
         if(p.used || anyValidPlacement(p.shape)) return;
@@ -500,20 +474,14 @@
       });
       return;
     }
-
-    // baked
     const anyFits = tray.some(p => !p.used && anyValidPlacement(p.shape));
     if(anyFits) return;
-
     let bestShape = null, bestCount = -1;
     SHAPES.forEach(shape=>{
       const c = countValidPlacements(shape);
       if(c > bestCount){ bestCount = c; bestShape = shape; }
     });
-
-    if(bestShape && bestCount > 0){
-      tray[0] = randomShapeColor(bestShape);
-    }
+    if(bestShape && bestCount > 0) tray[0] = randomShapeColor(bestShape);
   }
 
   function fillTray(){
@@ -589,12 +557,9 @@
     const boardRect = boardEl.getBoundingClientRect();
     const cellSize = (boardRect.width - 16) / SIZE;
     const {rows, cols} = shapeBounds(piece.shape);
-
     dragState = { trayIdx, piece, cellSize, boardRect, grabDX: cellSize*0.5, grabDY: cellSize*0.5 + 46, lastValid:false, lastR:-1, lastC:-1 };
-
     const slot = trayEl.querySelector(`.tray-slot[data-idx="${trayIdx}"]`);
     if(slot) slot.classList.add('dragging-source');
-
     ghostEl.innerHTML = '';
     ghostEl.style.gridTemplateColumns = `repeat(${cols}, ${cellSize}px)`;
     ghostEl.style.gridTemplateRows = `repeat(${rows}, ${cellSize}px)`;
@@ -670,7 +635,6 @@
     for(let r=0;r<SIZE;r++){ let full=true; for(let c=0;c<SIZE;c++) if(!board[boardIndex(r,c)].filled){ full=false; break; } if(full) fullRows.push(r); }
     for(let c=0;c<SIZE;c++){ let full=true; for(let r=0;r<SIZE;r++) if(!board[boardIndex(r,c)].filled){ full=false; break; } if(full) fullCols.push(c); }
     const linesCleared = fullRows.length + fullCols.length;
-
     if(linesCleared>0){
       streak++;
       noClearStreak = 0;
@@ -683,16 +647,11 @@
       fullCols.forEach(c=>{ for(let r=0;r<SIZE;r++) cellsToClear.add(boardIndex(r,c)); });
       cellsToClear.forEach(idx=>{ cellEls[idx].classList.add('clearing'); spawnConfetti(cellEls[idx]); });
       playSound('clear');
-
       const lineScore = linesCleared*10*linesCleared;
       const streakBonus = streak>1 ? streak*5 : 0;
       addScore(lineScore + streakBonus);
       showCombo(linesCleared, streak);
       updateQuestProgress();
-
-      // 盤面データのクリアが完了してから次のトレイ判定・ゲームオーバー判定を行う。
-      // これより前に判定してしまうと、ライン消去で空いたはずのマスがまだ「埋まっている」
-      // ことになり、実際には置ける場所があるのに誤ってゲームオーバーになってしまうため。
       setTimeout(()=>{
         cellsToClear.forEach(idx=>{ board[idx] = {filled:false, colorIdx:-1}; cellEls[idx].className='cell'; cellEls[idx].style.background=''; });
         if(tray.every(p=>p.used)) fillTray(); else checkGameOver();
@@ -744,7 +703,6 @@
     setTimeout(()=>el.remove(),950);
   }
 
-  // スコアを加算する共通処理。dailyStats.scoreEarned (1日の合計スコア)も同時に積み上げる
   function addScore(amount){
     score += amount;
     dailyStats.scoreEarned += amount;
@@ -758,17 +716,13 @@
   }
   function updateCoinUI(){ coinValEl.textContent = coins; saveCoins(coins); }
 
-  // ===================== コイン =====================
   function awardGameEndCoins(){
     const earned = Math.floor((score/50) * coinMultiplier());
-    if(earned>0){
-      coins += earned; updateCoinUI(); floatCoin(earned);
-    }
+    if(earned>0){ coins += earned; updateCoinUI(); floatCoin(earned); }
     return earned;
   }
 
-  // ===================== デイリークエスト =====================
-  // 「普通に遊んでいれば自然と達成する」だけでなく、狙って挑戦する価値のある目標にする
+  // ===================== クエスト =====================
   const QUEST_POOL = [
     { id:'singleScore400', desc:'1回のプレイでスコア400点以上を叩き出す', statKey:'bestSingleGameScore', target:400, reward:50 },
     { id:'tripleClear', desc:'1回の設置で3ライン以上同時に消す(トリプルクリア)', statKey:'tripleClearCount', target:1, reward:70 },
@@ -800,13 +754,12 @@
       if(res && res.value){
         const parsed = JSON.parse(res.value);
         if(parsed.date === today){
-          // 古い保存データに新しい統計項目が無くても壊れないようにデフォルト値とマージ
           dailyStats = { ...DAILY_STATS_DEFAULT, ...parsed.stats, date:today };
           quests = parsed.quests;
           return;
         }
       }
-    }catch(err){ /* キーが無い場合はここに来る */ }
+    }catch(err){}
     dailyStats = { date:today, ...DAILY_STATS_DEFAULT };
     quests = pickDailyQuests();
     await saveDailyQuests();
@@ -858,7 +811,7 @@
     });
   }
 
-  // ===================== スキン適用・購入 =====================
+  // ===================== スキン =====================
   function applySkin(id){
     const skin = SKINS.find(s=>s.id===id) || SKINS[0];
     equippedSkin = skin.id;
@@ -867,7 +820,6 @@
     if(titleEl) titleEl.style.background = skin.titleGrad;
     COLORS.length = 0;
     skin.colors.forEach(c=>COLORS.push(c));
-    // すでに盤面に置かれているブロックの色も新しいパレットに合わせて塗り直す
     if(cellEls.length){
       board.forEach((cellData, idx)=>{
         if(cellData.filled && COLORS[cellData.colorIdx]) cellEls[idx].style.background = COLORS[cellData.colorIdx].bg;
@@ -910,7 +862,7 @@
     try{ await window.storage.set(STORAGE_SKINS, JSON.stringify({owned:ownedSkins, equipped:equippedSkin}), false); }catch(err){}
   }
 
-  // ===================== 設定(モード・スキン)モーダル =====================
+  // ===================== 設定 =====================
   async function loadSettings(){
     let isFirstTime = true;
     try{
@@ -921,7 +873,7 @@
         SIZE = (currentMode==='extreme') ? 8 : Math.min(18, Math.max(5, parsed.size||8));
         isFirstTime = false;
       }
-    }catch(err){ /* 未設定 = 初回起動 */ }
+    }catch(err){}
     return isFirstTime;
   }
   async function saveSettings(){
@@ -983,11 +935,9 @@
       </div>
       <div id="settingsTabBody">${tab==='skin' ? renderSkinTab() : renderModeTab()}</div>
     `;
-
     modalContent.querySelectorAll('.tab-btn').forEach(btn=>{
       btn.addEventListener('click', ()=>renderSettingsModal(btn.dataset.stab));
     });
-
     if(tab==='skin'){
       modalContent.querySelectorAll('.claim-btn[data-skin]').forEach(btn=>{
         btn.addEventListener('click', ()=>{
@@ -1025,7 +975,7 @@
     modalOverlay.classList.add('show');
   });
 
-  // ===================== 永続化(ゲスト/ローカル) =====================
+  // ===================== 永続化 =====================
   async function loadBest(){
     try{ const res = await window.storage.get(STORAGE_BEST, false); if(res && res.value) best = parseInt(res.value,10)||0; }catch(err){ best=0; }
     bestValEl.textContent = best;
@@ -1037,7 +987,7 @@
   }
   async function saveCoins(val){ try{ await window.storage.set(STORAGE_COINS, String(val), false); }catch(err){} }
 
-  // ===================== サウンド(修正版) =====================
+  // ===================== サウンド =====================
   let audioCtx = null;
   function unlockAudio(){
     try{
@@ -1078,7 +1028,6 @@
     soundOn = !soundOn;
     soundBtn.textContent = soundOn ? '🔊' : '🔇';
   });
-  // 初回タップ/クリックでオーディオをアンロック(モバイルSafari対策)
   document.body.addEventListener('pointerdown', unlockAudio, { once:true });
 
   // ===================== ゲームオーバー =====================
@@ -1089,7 +1038,6 @@
     updateQuestProgress();
     const earned = awardGameEndCoins();
     if(earned>0) playSound('coin');
-
     finalScoreEl.textContent = score;
     newBestNoteEl.textContent = (score>=best && score>0) ? '🎉 ハイスコア更新！' : 'お疲れさまでした！';
     coinEarnedNoteEl.textContent = earned>0 ? `🪙 +${earned} コイン獲得！` : '';
@@ -1114,7 +1062,7 @@
     modalOverlay.classList.add('show');
   });
 
-  // ===================== アカウント(サーバー連携) =====================
+  // ===================== アカウント =====================
   function updateAccountButton(){
     accountBtn.textContent = currentUserId ? '👤' : '👤';
     accountBtn.title = currentUserId ? `ログイン中: ${currentUserId}` : '未ログイン';
@@ -1139,7 +1087,6 @@
       });
       return;
     }
-
     modalContent.innerHTML = `
       <h2 style="color:var(--gold);">👤 アカウント</h2>
       <div class="tab-row">
@@ -1147,21 +1094,18 @@
         <button class="tab-btn" data-tab="register">新規登録</button>
         <button class="tab-btn" data-tab="recover">復元</button>
       </div>
-
       <form class="auth-form active" id="loginForm">
         <label>ID</label><input type="text" id="loginId" autocomplete="username" />
         <label>パスワード</label><input type="password" id="loginPw" autocomplete="current-password" />
         <button type="submit" class="primary-btn">ログイン</button>
         <div class="auth-msg" id="loginMsg"></div>
       </form>
-
       <form class="auth-form" id="registerForm">
         <label>ID (半角英数字3〜20文字)</label><input type="text" id="regId" autocomplete="username" />
         <label>パスワード (6文字以上)</label><input type="password" id="regPw" autocomplete="new-password" />
         <button type="submit" class="primary-btn">新規登録</button>
         <div class="auth-msg" id="regMsg"></div>
       </form>
-
       <form class="auth-form" id="recoverForm">
         <label>ID</label><input type="text" id="recId" />
         <label>復元コード(管理者から受け取ったもの)</label><input type="text" id="recCode" placeholder="XXXX-XXXX-XXXX-XXXX" />
@@ -1170,7 +1114,6 @@
         <div class="auth-msg" id="recMsg"></div>
       </form>
     `;
-
     modalContent.querySelectorAll('.tab-btn').forEach(btn=>{
       btn.addEventListener('click', ()=>{
         modalContent.querySelectorAll('.tab-btn').forEach(b=>b.classList.remove('active'));
@@ -1179,7 +1122,6 @@
         modalContent.querySelector(`#${btn.dataset.tab}Form`).classList.add('active');
       });
     });
-
     document.getElementById('loginForm').addEventListener('submit', async (e)=>{
       e.preventDefault();
       const id = document.getElementById('loginId').value.trim();
@@ -1200,7 +1142,6 @@
         msgEl.className='auth-msg error';
       }
     });
-
     document.getElementById('registerForm').addEventListener('submit', async (e)=>{
       e.preventDefault();
       const id = document.getElementById('regId').value.trim();
@@ -1222,7 +1163,6 @@
         msgEl.className='auth-msg error';
       }
     });
-
     document.getElementById('recoverForm').addEventListener('submit', async (e)=>{
       e.preventDefault();
       const id = document.getElementById('recId').value.trim();
@@ -1268,6 +1208,104 @@
     }catch(err){ console.warn('サーバーからの取得に失敗しました:', err.message); }
   }
 
+  // ===================== ⭐ ランキング機能 =====================
+  async function renderRankingModal() {
+    modalContent.dataset.mode = 'ranking';
+    modalContent.innerHTML = `
+      <h2 style="color:var(--gold);">🏆 ランキング TOP10</h2>
+      <div class="sub">🔄 読み込み中...</div>
+    `;
+    try {
+      const res = await fetch(`${API_BASE_URL}/api/ranking`);
+      const data = await res.json();
+      let html = `
+        <h2 style="color:var(--gold);">🏆 ランキング TOP10</h2>
+        <div class="sub">全 ${data.totalUsers || 0} 人中の実力者たち！</div>
+        <div style="text-align:left; margin-top: 12px; max-height: 380px; overflow-y: auto;">
+      `;
+      if (data.top && data.top.length > 0) {
+        data.top.forEach((user, index) => {
+          const medal = index === 0 ? '🥇' : index === 1 ? '🥈' : index === 2 ? '🥉' : `${index + 1}.`;
+          const isMe = user.id === currentUserId;
+          html += `
+            <div style="display:flex; justify-content:space-between; padding:8px 4px; border-bottom:1px solid rgba(255,255,255,0.05); ${isMe ? 'background:rgba(255,217,61,0.15); border-radius:8px;' : ''}">
+              <span style="font-weight:700; ${isMe ? 'color:var(--gold);' : ''}">${medal} ${user.id} ${isMe ? '👈' : ''}</span>
+              <span style="color:var(--gold); font-weight:800;">${user.best_score}点</span>
+            </div>
+          `;
+        });
+      } else {
+        html += `<div class="sub">まだランキングに登録されたユーザーがいません。</div>`;
+      }
+      html += `</div>`;
+
+      // 自分の順位（下部固定）
+      if (authToken && currentUserId) {
+        let myScore = 0;
+        try {
+          const syncRes = await fetch(`${API_BASE_URL}/api/sync`, {
+            headers: { 'Authorization': `Bearer ${authToken}` }
+          });
+          const syncData = await syncRes.json();
+          myScore = syncData.bestScore || 0;
+        } catch (err) {}
+        if (myScore > 0) {
+          const higherCount = data.top ? data.top.filter(u => u.best_score > myScore).length : 0;
+          const myInTop = data.top ? data.top.some(u => u.id === currentUserId) : false;
+          let rankDisplay = myInTop ? `${data.top.findIndex(u => u.id === currentUserId) + 1}位` : `${higherCount + 1}位以上`;
+          html += `
+            <div style="
+              margin-top: 16px;
+              padding: 14px 16px;
+              background: linear-gradient(135deg, var(--panel-light), var(--panel));
+              border-radius: 14px;
+              border: 2px solid var(--gold);
+              display: flex;
+              justify-content: space-between;
+              align-items: center;
+              position: sticky;
+              bottom: 0;
+              backdrop-filter: blur(8px);
+            ">
+              <span style="font-weight:700; color:var(--gold);">👤 ${currentUserId} の順位</span>
+              <span style="font-weight:800; font-size:20px; color:var(--gold);">
+                ${rankDisplay}
+                <span style="font-size:14px; color:var(--text-dim); font-weight:400; margin-left:8px;">
+                  ${myScore}点
+                </span>
+              </span>
+            </div>
+          `;
+        } else {
+          html += `
+            <div style="margin-top:16px; padding:14px 16px; background:var(--panel-light); border-radius:14px; text-align:center; color:var(--text-dim);">
+              📊 まだスコアがありません。ゲームをプレイして順位を獲得しよう！
+            </div>
+          `;
+        }
+      } else {
+        html += `
+          <div style="margin-top:16px; padding:14px 16px; background:var(--panel-light); border-radius:14px; text-align:center; color:var(--text-dim);">
+            🔐 ログインすると自分の順位が表示されます
+          </div>
+        `;
+      }
+      modalContent.innerHTML = html;
+    } catch (err) {
+      console.error('ランキング取得エラー:', err);
+      modalContent.innerHTML = `
+        <h2>🏆 ランキング</h2>
+        <div class="sub" style="color:var(--coral);">❌ ランキングの読み込みに失敗しました</div>
+        <button class="ghost-btn" onclick="document.getElementById('rankingBtn').click()">🔄 再読み込み</button>
+      `;
+    }
+  }
+
+  rankingBtn.addEventListener('click', () => {
+    renderRankingModal();
+    modalOverlay.classList.add('show');
+  });
+
   // ===================== 初期化 =====================
   (async function start(){
     await loadBest();
@@ -1280,7 +1318,6 @@
     initBoard();
     fillTray();
     if(isFirstTime){
-      // 初回起動時だけ、モード・盤面サイズを選んでもらうために設定画面を開く
       pendingMode = currentMode; pendingSize = SIZE;
       renderSettingsModal('mode');
       modalOverlay.classList.add('show');
