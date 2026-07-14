@@ -49,7 +49,6 @@ pool.query(`
     recovery_code_used BOOLEAN DEFAULT FALSE,
     best_score INTEGER DEFAULT 0,
     coins INTEGER DEFAULT 0,
-    play_time INTEGER DEFAULT 0,
     skins TEXT DEFAULT '["default"]',
     equipped_skin TEXT DEFAULT 'default',
     quests TEXT DEFAULT '[]',
@@ -58,7 +57,7 @@ pool.query(`
   );
 `);
 
-// ===================== カラム自動追加 =====================
+// ===================== カラム自動追加（play_time 含む） =====================
 pool.query(`
   ALTER TABLE users ADD COLUMN IF NOT EXISTS best_scores JSONB DEFAULT '{}';
   ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_settings JSONB DEFAULT '{"disabledBlocks":[],"safetyMode":false}';
@@ -66,9 +65,9 @@ pool.query(`
   ALTER TABLE users ADD COLUMN IF NOT EXISTS banned BOOLEAN DEFAULT FALSE;
   ALTER TABLE users ADD COLUMN IF NOT EXISTS play_time INTEGER DEFAULT 0;
 `).then(() => {
-  console.log('✅ カラム追加完了');
+  console.log('✅ カラム追加完了（best_scores, admin_settings, quest_progress, banned, play_time）');
 }).catch(err => {
-  console.warn('⚠️ カラム追加:', err.message);
+  console.warn('⚠️ カラム追加（一部既存の可能性あり）:', err.message);
 });
 
 function generateRecoveryCode() {
@@ -117,7 +116,7 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-// ===================== ログイン（BANチェック付き） =====================
+// ===================== ログイン（BANチェック・play_time返却） =====================
 app.post('/api/login', async (req, res) => {
   const { id, password } = req.body;
   try {
@@ -160,7 +159,7 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ===================== データ同期 =====================
+// ===================== データ同期（play_time 対応） =====================
 app.post('/api/sync', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: '認証が必要です' });
@@ -171,6 +170,7 @@ app.post('/api/sync', async (req, res) => {
     const values = [];
     let paramCount = 1;
 
+    // 8x8 かつ mode 指定あり → best_scores にモード別保存
     if (size === 8 && mode && bestScore !== undefined) {
       const userResult = await pool.query('SELECT best_scores FROM users WHERE id = $1', [id]);
       let bestScores = userResult.rows[0]?.best_scores || {};
@@ -312,7 +312,7 @@ app.post('/api/renew-recovery', async (req, res) => {
 
 // ===================== ランキング取得（スコア・コイン・プレイ時間） =====================
 app.get('/api/ranking', async (req, res) => {
-  const mode = req.query.mode || 'baked';
+  const mode = req.query.mode || 'soft';
   const type = req.query.type || 'score'; // score, coins, playtime
 
   try {
@@ -326,10 +326,10 @@ app.get('/api/ranking', async (req, res) => {
     } else {
       // スコアランキング（モード別）
       query = `
-        SELECT id, best_scores->>'${mode}' as value 
-        FROM users 
+        SELECT id, best_scores->>'${mode}' as value
+        FROM users
         WHERE best_scores->>'${mode}' IS NOT NULL AND best_scores->>'${mode}' != '0'
-        ORDER BY (best_scores->>'${mode}')::int DESC 
+        ORDER BY (best_scores->>'${mode}')::int DESC
         LIMIT 10
       `;
       countQuery = `
@@ -342,7 +342,7 @@ app.get('/api/ranking', async (req, res) => {
 
     const top = topResult.rows.map(r => ({
       id: r.id,
-      value: type === 'coins' || type === 'playtime' ? parseInt(r.value) : parseInt(r.value)
+      value: parseInt(r.value)
     }));
 
     res.json({
@@ -422,7 +422,7 @@ app.delete('/api/account/delete', async (req, res) => {
   }
 });
 
-// ===================== 管理者コマンド =====================
+// ===================== 管理者コマンド（/setplaytime 追加） =====================
 app.post('/api/admin/command', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: '認証が必要です' });
@@ -449,11 +449,11 @@ app.post('/api/admin/command', async (req, res) => {
       }
       case '/setscore': {
         if (args.length < 2) {
-          throw new Error('使用法: /setscore <mode> <score> (例: /setscore baked 5000)');
+          throw new Error('使用法: /setscore <mode> <score> (例: /setscore soft 5000)');
         }
         const mode = args[0];
         const score = parseInt(args[1]);
-        const validModes = ['baked', 'hard', 'extreme', 'soft'];
+        const validModes = ['soft', 'baked', 'hard', 'extreme'];
         if (!validModes.includes(mode)) {
           throw new Error(`モードは ${validModes.join(', ')} のいずれかです`);
         }
@@ -492,6 +492,13 @@ app.post('/api/admin/command', async (req, res) => {
         result = '✅ 全ユーザーのクエスト進捗をリセットしました。';
         break;
       }
+      case '/setplaytime': {
+        const time = parseInt(args[0]);
+        if (isNaN(time) || time < 0) throw new Error('正しいプレイ時間（秒）を指定してください');
+        await pool.query('UPDATE users SET play_time = $1 WHERE id = $2', [time, id]);
+        result = `✅ プレイ時間を ${time}秒 に設定しました。`;
+        break;
+      }
       case '/ban': {
         const targetId = args[0];
         if (!targetId) throw new Error('使用法: /ban <ユーザーID>');
@@ -523,13 +530,6 @@ app.post('/api/admin/command', async (req, res) => {
         result = `✅ ${targetId} のデータをリセットしました。`;
         break;
       }
-      case '/setplaytime': {
-        const time = parseInt(args[0]);
-        if (isNaN(time) || time < 0) throw new Error('正しいプレイ時間（秒）を指定してください');
-        await pool.query('UPDATE users SET play_time = $1 WHERE id = $2', [time, id]);
-        result = `✅ プレイ時間を ${time}秒 に設定しました。`;
-        break;
-      }
       case '/listusers': {
         const users = await pool.query('SELECT id, best_score, coins, play_time FROM users ORDER BY best_score DESC LIMIT 20');
         result = '📊 ユーザー一覧 (TOP20):\n' + users.rows.map(u => `${u.id}: ${u.best_score}点, ${u.coins}コイン, ${u.play_time}秒`).join('\n');
@@ -541,78 +541,4 @@ app.post('/api/admin/command', async (req, res) => {
         const user = await pool.query('SELECT * FROM users WHERE id = $1', [targetId]);
         if (user.rows.length === 0) throw new Error(`ユーザー ${targetId} は見つかりません`);
         const u = user.rows[0];
-        result = `🔍 ユーザー情報:\nID: ${u.id}\n🏆 ベストスコア: ${u.best_score}\n🪙 コイン: ${u.coins}\n⏱️ プレイ時間: ${u.play_time || 0}秒\n🚫 BAN: ${u.banned ? 'BAN中' : 'なし'}\n📅 作成日: ${new Date(u.created_at).toLocaleString('ja-JP')}\n📅 最終ログイン: ${u.last_login ? new Date(u.last_login).toLocaleString('ja-JP') : 'なし'}`;
-        break;
-      }
-      case '/stats': {
-        const totalUsers = await pool.query('SELECT COUNT(*) FROM users');
-        const totalScore = await pool.query('SELECT SUM(best_score) FROM users');
-        const totalCoins = await pool.query('SELECT SUM(coins) FROM users');
-        const totalPlayTime = await pool.query('SELECT SUM(play_time) FROM users');
-        result = `📊 サーバー統計:\n👤 総ユーザー数: ${totalUsers.rows[0].count}\n🏆 総スコア: ${totalScore.rows[0].sum || 0}\n🪙 総コイン: ${totalCoins.rows[0].sum || 0}\n⏱️ 総プレイ時間: ${totalPlayTime.rows[0].sum || 0}秒`;
-        break;
-      }
-      case '/help':
-      default:
-        result = `📋 使用可能なコマンド:
-  /setcoins <amount> - コインを指定値に設定
-  /setscore <mode> <score> - モード別スコア設定 (baked, hard, extreme, soft)
-  /safety [on|off] - 強制セーフティモード
-  /resetquests - 全ユーザーのクエスト進捗リセット
-  /setplaytime <seconds> - プレイ時間を設定
-  /ban <ID> - ユーザーをBAN
-  /unban <ID> - BAN解除
-  /resetuser <ID> - ユーザーデータリセット
-  /listusers - ユーザー一覧表示
-  /search <ID> - ユーザー情報検索
-  /stats - サーバー統計情報
-  /help - このヘルプ`;
-        break;
-    }
-
-    res.json({ success: true, result });
-  } catch (err) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-// ===================== 管理者API =====================
-app.get('/api/admin/block-settings', async (req, res) => {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ error: '認証が必要です' });
-  try {
-    const { id } = jwt.verify(token, JWT_SECRET);
-    if (id !== 'admin') return res.status(403).json({ error: '管理者権限がありません' });
-    const result = await pool.query('SELECT admin_settings FROM users WHERE id = $1', [id]);
-    const settings = result.rows[0]?.admin_settings || { disabledBlocks: [], safetyMode: false };
-    res.json(settings);
-  } catch (err) {
-    res.status(401).json({ error: '認証エラー' });
-  }
-});
-
-app.post('/api/admin/block-toggle', async (req, res) => {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ error: '認証が必要です' });
-  try {
-    const { id } = jwt.verify(token, JWT_SECRET);
-    if (id !== 'admin') return res.status(403).json({ error: '管理者権限がありません' });
-    const { blockIndex, enabled } = req.body;
-    const result = await pool.query('SELECT admin_settings FROM users WHERE id = $1', [id]);
-    let settings = result.rows[0]?.admin_settings || { disabledBlocks: [], safetyMode: false };
-    if (enabled) {
-      settings.disabledBlocks = settings.disabledBlocks.filter(i => i !== blockIndex);
-    } else {
-      if (!settings.disabledBlocks.includes(blockIndex)) {
-        settings.disabledBlocks.push(blockIndex);
-      }
-    }
-    await pool.query('UPDATE users SET admin_settings = $1 WHERE id = $2', [JSON.stringify(settings), id]);
-    res.json({ success: true, settings });
-  } catch (err) {
-    res.status(401).json({ error: '認証エラー' });
-  }
-});
-
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+        result = `🔍 ユーザー情報:\nID: ${u.id}\n🏆 ベストスコア: ${u.best_score}\n🪙 コイン: ${
