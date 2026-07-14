@@ -40,7 +40,7 @@ async function sendDiscordNotification(webhookUrl, title, description, color = 0
   }
 }
 
-// テーブル作成
+// ===================== テーブル作成（初回のみ） =====================
 pool.query(`
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -48,19 +48,28 @@ pool.query(`
     recovery_code TEXT,
     recovery_code_used BOOLEAN DEFAULT FALSE,
     best_score INTEGER DEFAULT 0,
-    best_scores JSONB DEFAULT '{}',
     coins INTEGER DEFAULT 0,
     skins TEXT DEFAULT '["default"]',
     equipped_skin TEXT DEFAULT 'default',
     quests TEXT DEFAULT '[]',
-    quest_progress JSONB DEFAULT '{}',
-    admin_settings JSONB DEFAULT '{"disabledBlocks":[],"safetyMode":false}',
-    banned BOOLEAN DEFAULT FALSE,
     last_login TIMESTAMP,
     created_at TIMESTAMP DEFAULT NOW()
   );
 `);
 
+// ===================== ⭐ カラム自動追加（これでSQL Editor不要！） =====================
+pool.query(`
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS best_scores JSONB DEFAULT '{}';
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_settings JSONB DEFAULT '{"disabledBlocks":[],"safetyMode":false}';
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS quest_progress JSONB DEFAULT '{}';
+  ALTER TABLE users ADD COLUMN IF NOT EXISTS banned BOOLEAN DEFAULT FALSE;
+`).then(() => {
+  console.log('✅ カラム追加完了（best_scores, admin_settings, quest_progress, banned）');
+}).catch(err => {
+  console.warn('⚠️ カラム追加（一部既存の可能性あり）:', err.message);
+});
+
+// ===================== 復元コード生成 =====================
 function generateRecoveryCode() {
   const parts = [];
   for (let i = 0; i < 4; i++) {
@@ -69,7 +78,7 @@ function generateRecoveryCode() {
   return parts.join('-');
 }
 
-// ===== ユーザー登録 =====
+// ===================== ユーザー登録 =====================
 app.post('/api/register', async (req, res) => {
   const { id, password } = req.body;
   if (!id || !password || password.length < 6) {
@@ -107,7 +116,7 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
-// ===== ログイン（BANチェック付き） =====
+// ===================== ログイン（BANチェック付き） =====================
 app.post('/api/login', async (req, res) => {
   const { id, password } = req.body;
   try {
@@ -142,7 +151,7 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ===== データ同期（best_scores 対応） =====
+// ===================== データ同期（best_scores 対応） =====================
 app.post('/api/sync', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: '認証が必要です' });
@@ -162,7 +171,6 @@ app.post('/api/sync', async (req, res) => {
         updateFields.push(`best_scores = $${paramCount++}`);
         values.push(JSON.stringify(bestScores));
       }
-      // 互換性のため best_score も更新（最大値）
       if (bestScore > 0) {
         const currentBest = userResult.rows[0]?.best_score || 0;
         if (bestScore > currentBest) {
@@ -202,7 +210,7 @@ app.post('/api/sync', async (req, res) => {
   }
 });
 
-// ===== データ取得 =====
+// ===================== データ取得 =====================
 app.get('/api/sync', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: '認証が必要です' });
@@ -224,7 +232,7 @@ app.get('/api/sync', async (req, res) => {
   }
 });
 
-// ===== パスワード復元 =====
+// ===================== パスワード復元 =====================
 app.post('/api/recover', async (req, res) => {
   const { id, recoveryCode, newPassword } = req.body;
   if (!newPassword || newPassword.length < 6) {
@@ -261,7 +269,7 @@ app.post('/api/recover', async (req, res) => {
   }
 });
 
-// ===== 復元コード再発行 =====
+// ===================== 復元コード再発行 =====================
 app.post('/api/renew-recovery', async (req, res) => {
   const { id } = req.body;
   if (!id) return res.status(400).json({ error: 'IDが必要です' });
@@ -289,7 +297,7 @@ app.post('/api/renew-recovery', async (req, res) => {
   }
 });
 
-// ===== ランキング取得（モード別・best_scores 対応） =====
+// ===================== ランキング取得（モード別） =====================
 app.get('/api/ranking', async (req, res) => {
   const mode = req.query.mode || 'baked';
   try {
@@ -381,7 +389,7 @@ app.delete('/api/account/delete', async (req, res) => {
   }
 });
 
-// ===================== 管理者コマンド（完全版） =====================
+// ===================== 管理者コマンド =====================
 app.post('/api/admin/command', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: '認証が必要です' });
@@ -398,7 +406,6 @@ app.post('/api/admin/command', async (req, res) => {
     let result = '';
 
     switch (cmd) {
-      // ===== コイン設定（上書き） =====
       case '/setcoins': {
         const amount = parseInt(args[0]);
         if (isNaN(amount) || amount < 0) throw new Error('正しいコイン数を指定してください');
@@ -406,7 +413,6 @@ app.post('/api/admin/command', async (req, res) => {
         result = `✅ コインを ${amount} に設定しました。`;
         break;
       }
-      // ===== スコア設定（モード別） =====
       case '/setscore': {
         if (args.length < 2) {
           throw new Error('使用法: /setscore <mode> <score> (例: /setscore baked 5000)');
@@ -421,7 +427,6 @@ app.post('/api/admin/command', async (req, res) => {
         const userResult = await pool.query('SELECT best_scores FROM users WHERE id = $1', [id]);
         let bestScores = userResult.rows[0]?.best_scores || {};
         bestScores[mode] = score;
-        // best_score も最大値で更新
         const allScores = Object.values(bestScores).filter(v => typeof v === 'number');
         const maxScore = allScores.length > 0 ? Math.max(...allScores) : 0;
         await pool.query(
@@ -431,7 +436,6 @@ app.post('/api/admin/command', async (req, res) => {
         result = `✅ ${mode}モードのベストスコアを ${score} に設定しました。`;
         break;
       }
-      // ===== 強制セーフティ（状態表示も可能） =====
       case '/safety': {
         if (args.length === 0) {
           const settingResult = await pool.query('SELECT admin_settings FROM users WHERE id = $1', [id]);
@@ -449,13 +453,11 @@ app.post('/api/admin/command', async (req, res) => {
         result = `✅ 強制セーフティモードを ${mode} に設定しました。`;
         break;
       }
-      // ===== クエストリセット =====
       case '/resetquests': {
         await pool.query('UPDATE users SET quest_progress = $1', [JSON.stringify({})]);
         result = '✅ 全ユーザーのクエスト進捗をリセットしました。';
         break;
       }
-      // ===== BAN =====
       case '/ban': {
         const targetId = args[0];
         if (!targetId) throw new Error('使用法: /ban <ユーザーID>');
@@ -463,7 +465,6 @@ app.post('/api/admin/command', async (req, res) => {
         result = `✅ ${targetId} をBANしました。`;
         break;
       }
-      // ===== BAN解除 =====
       case '/unban': {
         const targetId = args[0];
         if (!targetId) throw new Error('使用法: /unban <ユーザーID>');
@@ -471,7 +472,6 @@ app.post('/api/admin/command', async (req, res) => {
         result = `✅ ${targetId} のBANを解除しました。`;
         break;
       }
-      // ===== ユーザーデータリセット =====
       case '/resetuser': {
         const targetId = args[0];
         if (!targetId) throw new Error('使用法: /resetuser <ユーザーID>');
@@ -488,13 +488,11 @@ app.post('/api/admin/command', async (req, res) => {
         result = `✅ ${targetId} のデータをリセットしました。`;
         break;
       }
-      // ===== ユーザー一覧 =====
       case '/listusers': {
         const users = await pool.query('SELECT id, best_score, coins FROM users ORDER BY best_score DESC LIMIT 20');
         result = '📊 ユーザー一覧 (TOP20):\n' + users.rows.map(u => `${u.id}: ${u.best_score}点, ${u.coins}コイン`).join('\n');
         break;
       }
-      // ===== ユーザー検索 =====
       case '/search': {
         const targetId = args[0];
         if (!targetId) throw new Error('使用法: /search <ユーザーID>');
@@ -504,7 +502,6 @@ app.post('/api/admin/command', async (req, res) => {
         result = `🔍 ユーザー情報:\nID: ${u.id}\n🏆 ベストスコア: ${u.best_score}\n🪙 コイン: ${u.coins}\n🚫 BAN: ${u.banned ? 'BAN中' : 'なし'}\n📅 作成日: ${new Date(u.created_at).toLocaleString('ja-JP')}\n📅 最終ログイン: ${u.last_login ? new Date(u.last_login).toLocaleString('ja-JP') : 'なし'}`;
         break;
       }
-      // ===== サーバー統計 =====
       case '/stats': {
         const totalUsers = await pool.query('SELECT COUNT(*) FROM users');
         const totalScore = await pool.query('SELECT SUM(best_score) FROM users');
@@ -512,7 +509,6 @@ app.post('/api/admin/command', async (req, res) => {
         result = `📊 サーバー統計:\n👤 総ユーザー数: ${totalUsers.rows[0].count}\n🏆 総スコア: ${totalScore.rows[0].sum || 0}\n🪙 総コイン: ${totalCoins.rows[0].sum || 0}`;
         break;
       }
-      // ===== ヘルプ =====
       case '/help':
       default:
         result = `📋 使用可能なコマンド:
@@ -536,7 +532,7 @@ app.post('/api/admin/command', async (req, res) => {
   }
 });
 
-// ===================== 管理者API（block-settingsのみ） =====================
+// ===================== 管理者API（ブロック設定用） =====================
 app.get('/api/admin/block-settings', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: '認証が必要です' });
