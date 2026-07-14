@@ -16,17 +16,15 @@ const pool = new Pool({
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
 
-const DISCORD_WEBHOOK_AUTH = process.env.DISCORD_WEBHOOK_AUTH || 'https://discord.com/api/webhooks/1525717594068484269/7X2VC7lNmTBClwuvIW2dUVCBXvQ0MvLvEOysc6CfJ5alH053dPRSyk1QLdHdbUQIT9XZ';
-const DISCORD_WEBHOOK_LOGIN = process.env.DISCORD_WEBHOOK_LOGIN || 'https://discord.com/api/webhooks/1525717768887074931/xoPqn15l2ZzJ5TZLXjI74gyrnZDRjjAXnBJLlRfcdyb2-zOy2Y0BIOv1TFtyV777ZyN8';
+const DISCORD_WEBHOOK_AUTH = process.env.DISCORD_WEBHOOK_AUTH || '';
+const DISCORD_WEBHOOK_LOGIN = process.env.DISCORD_WEBHOOK_LOGIN || '';
 
 async function sendDiscordNotification(webhookUrl, title, description, color = 0x5865F2, fields = []) {
   if (!webhookUrl) return;
   try {
     const payload = {
       embeds: [{
-        title,
-        description,
-        color,
+        title, description, color,
         timestamp: new Date().toISOString(),
         fields,
         footer: { text: 'CandyBlast Auth System' }
@@ -139,25 +137,51 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ===== データ同期 =====
+// ===== データ同期（保存） =====
 app.post('/api/sync', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: '認証が必要です' });
   try {
     const { id } = jwt.verify(token, JWT_SECRET);
-    const { bestScore, coins, skins, equippedSkin, quests } = req.body;
-    await pool.query(
-      `UPDATE users SET 
-        best_score = $1, coins = $2, skins = $3, equipped_skin = $4, quests = $5
-       WHERE id = $6`,
-      [bestScore || 0, coins || 0, JSON.stringify(skins), equippedSkin || 'default', JSON.stringify(quests || []), id]
-    );
+    const { bestScore, coins, skins, equippedSkin, quests, mode, size } = req.body;
+    // 8x8の時だけbest_scoreを更新（ランキング対象）
+    const updateFields = [];
+    const values = [];
+    let paramCount = 1;
+    
+    if (size === 8 && bestScore !== undefined) {
+      updateFields.push(`best_score = $${paramCount++}`);
+      values.push(bestScore || 0);
+    }
+    if (coins !== undefined) {
+      updateFields.push(`coins = $${paramCount++}`);
+      values.push(coins || 0);
+    }
+    if (skins !== undefined) {
+      updateFields.push(`skins = $${paramCount++}`);
+      values.push(JSON.stringify(skins));
+    }
+    if (equippedSkin !== undefined) {
+      updateFields.push(`equipped_skin = $${paramCount++}`);
+      values.push(equippedSkin || 'default');
+    }
+    if (quests !== undefined) {
+      updateFields.push(`quests = $${paramCount++}`);
+      values.push(JSON.stringify(quests || []));
+    }
+    if (updateFields.length === 0) {
+      return res.json({ success: true });
+    }
+    values.push(id);
+    const query = `UPDATE users SET ${updateFields.join(', ')} WHERE id = $${paramCount}`;
+    await pool.query(query, values);
     res.json({ success: true });
   } catch (err) {
     res.status(401).json({ error: '認証エラー' });
   }
 });
 
+// ===== データ取得 =====
 app.get('/api/sync', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: '認証が必要です' });
@@ -215,6 +239,7 @@ app.post('/api/recover', async (req, res) => {
   }
 });
 
+// ===== 復元コード再発行 =====
 app.post('/api/renew-recovery', async (req, res) => {
   const { id } = req.body;
   if (!id) return res.status(400).json({ error: 'IDが必要です' });
@@ -242,9 +267,12 @@ app.post('/api/renew-recovery', async (req, res) => {
   }
 });
 
-// ===== ランキング =====
+// ===== ランキング取得（モード別） =====
 app.get('/api/ranking', async (req, res) => {
+  const mode = req.query.mode || 'baked';
   try {
+    // 各モードのスコアは別途保存する必要があるが、現状はbest_scoreを共有
+    // 将来的にはmode別カラムを追加推奨
     const topResult = await pool.query(
       'SELECT id, best_score FROM users WHERE best_score > 0 ORDER BY best_score DESC LIMIT 10'
     );
@@ -315,16 +343,87 @@ app.post('/api/quests/claim', async (req, res) => {
   }
 });
 
-app.post('/api/admin/reset-quests', async (req, res) => {
+// ===================== アカウント削除 =====================
+app.delete('/api/account/delete', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: '認証が必要です' });
+  try {
+    const { id } = jwt.verify(token, JWT_SECRET);
+    await pool.query('DELETE FROM users WHERE id = $1', [id]);
+    res.json({ success: true });
+  } catch (err) {
+    res.status(401).json({ error: '認証エラー' });
+  }
+});
+
+// ===================== 管理者コマンド =====================
+app.post('/api/admin/command', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: '認証が必要です' });
   try {
     const { id } = jwt.verify(token, JWT_SECRET);
     if (id !== 'admin') return res.status(403).json({ error: '管理者権限がありません' });
-    await pool.query('UPDATE users SET quest_progress = $1', [JSON.stringify({})]);
-    res.json({ success: true, message: '全ユーザーのクエスト進捗をリセットしました' });
+    
+    const { command } = req.body;
+    if (!command) return res.status(400).json({ error: 'コマンドを入力してください' });
+    
+    const parts = command.trim().split(/\s+/);
+    const cmd = parts[0].toLowerCase();
+    const args = parts.slice(1);
+    let result = '';
+    
+    switch (cmd) {
+      case '/givecoins': {
+        const amount = parseInt(args[0]);
+        if (isNaN(amount) || amount < 0) throw new Error('正しいコイン数を指定してください');
+        await pool.query('UPDATE users SET coins = coins + $1 WHERE id = $2', [amount, id]);
+        const user = await pool.query('SELECT coins FROM users WHERE id = $1', [id]);
+        result = `✅ コインを ${amount} 追加しました。現在のコイン: ${user.rows[0].coins}`;
+        break;
+      }
+      case '/setscore': {
+        const score = parseInt(args[0]);
+        if (isNaN(score) || score < 0) throw new Error('正しいスコアを指定してください');
+        await pool.query('UPDATE users SET best_score = $1 WHERE id = $2', [score, id]);
+        result = `✅ ベストスコアを ${score} に設定しました。`;
+        break;
+      }
+      case '/safety': {
+        const mode = args[0]?.toLowerCase();
+        if (mode !== 'on' && mode !== 'off') throw new Error('on または off を指定してください');
+        const safetyMode = mode === 'on';
+        const settingResult = await pool.query('SELECT admin_settings FROM users WHERE id = $1', [id]);
+        let settings = settingResult.rows[0]?.admin_settings || { disabledBlocks: [], safetyMode: false };
+        settings.safetyMode = safetyMode;
+        await pool.query('UPDATE users SET admin_settings = $1 WHERE id = $2', [JSON.stringify(settings), id]);
+        result = `✅ 強制セーフティモードを ${mode} に設定しました。`;
+        break;
+      }
+      case '/resetquests': {
+        await pool.query('UPDATE users SET quest_progress = $1', [JSON.stringify({})]);
+        result = '✅ 全ユーザーのクエスト進捗をリセットしました。';
+        break;
+      }
+      case '/listusers': {
+        const users = await pool.query('SELECT id, best_score, coins FROM users ORDER BY best_score DESC LIMIT 20');
+        result = '📊 ユーザー一覧 (TOP20):\n' + users.rows.map(u => `${u.id}: ${u.best_score}点, ${u.coins}コイン`).join('\n');
+        break;
+      }
+      case '/help':
+      default:
+        result = `📋 使用可能なコマンド:
+  /givecoins <amount> - コインを追加
+  /setscore <score> - ベストスコアを設定
+  /safety on|off - 強制セーフティモード
+  /resetquests - 全ユーザーのクエスト進捗リセット
+  /listusers - ユーザー一覧表示
+  /help - このヘルプ`;
+        break;
+    }
+    
+    res.json({ success: true, result });
   } catch (err) {
-    res.status(401).json({ error: '認証エラー' });
+    res.status(400).json({ error: err.message });
   }
 });
 
