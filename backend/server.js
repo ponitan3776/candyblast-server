@@ -42,7 +42,7 @@ async function sendDiscordNotification(webhookUrl, title, description, color = 0
   }
 }
 
-// ===== テーブル作成（初回のみ） =====
+// テーブル作成
 pool.query(`
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -139,7 +139,7 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// ===== データ同期（保存） =====
+// ===== データ同期 =====
 app.post('/api/sync', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: '認証が必要です' });
@@ -158,7 +158,6 @@ app.post('/api/sync', async (req, res) => {
   }
 });
 
-// ===== データ取得 =====
 app.get('/api/sync', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: '認証が必要です' });
@@ -216,7 +215,6 @@ app.post('/api/recover', async (req, res) => {
   }
 });
 
-// ===== 復元コード再発行 =====
 app.post('/api/renew-recovery', async (req, res) => {
   const { id } = req.body;
   if (!id) return res.status(400).json({ error: 'IDが必要です' });
@@ -244,7 +242,7 @@ app.post('/api/renew-recovery', async (req, res) => {
   }
 });
 
-// ===== ランキング取得 =====
+// ===== ランキング =====
 app.get('/api/ranking', async (req, res) => {
   try {
     const topResult = await pool.query(
@@ -264,7 +262,6 @@ app.get('/api/ranking', async (req, res) => {
 });
 
 // ===================== クエスト管理API =====================
-
 app.get('/api/quests/progress', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: '認証が必要です' });
@@ -332,7 +329,6 @@ app.post('/api/admin/reset-quests', async (req, res) => {
 });
 
 // ===================== 管理者API =====================
-
 app.post('/api/admin/coins', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: '認証が必要です' });
