@@ -40,7 +40,7 @@ async function sendDiscordNotification(webhookUrl, title, description, color = 0
   }
 }
 
-// テーブル作成（best_scores カラム追加）
+// テーブル作成
 pool.query(`
   CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -162,10 +162,13 @@ app.post('/api/sync', async (req, res) => {
         updateFields.push(`best_scores = $${paramCount++}`);
         values.push(JSON.stringify(bestScores));
       }
-      // 互換性のため best_score も更新
+      // 互換性のため best_score も更新（最大値）
       if (bestScore > 0) {
-        updateFields.push(`best_score = $${paramCount++}`);
-        values.push(bestScore);
+        const currentBest = userResult.rows[0]?.best_score || 0;
+        if (bestScore > currentBest) {
+          updateFields.push(`best_score = $${paramCount++}`);
+          values.push(bestScore);
+        }
       }
     }
 
@@ -405,15 +408,26 @@ app.post('/api/admin/command', async (req, res) => {
       }
       // ===== スコア設定（モード別） =====
       case '/setscore': {
+        if (args.length < 2) {
+          throw new Error('使用法: /setscore <mode> <score> (例: /setscore baked 5000)');
+        }
         const mode = args[0];
         const score = parseInt(args[1]);
         const validModes = ['baked', 'hard', 'extreme', 'soft'];
-        if (!mode || !validModes.includes(mode)) throw new Error('使用法: /setscore <mode> <score> (mode: baked, hard, extreme, soft)');
+        if (!validModes.includes(mode)) {
+          throw new Error(`モードは ${validModes.join(', ')} のいずれかです`);
+        }
         if (isNaN(score) || score < 0) throw new Error('正しいスコアを指定してください');
         const userResult = await pool.query('SELECT best_scores FROM users WHERE id = $1', [id]);
         let bestScores = userResult.rows[0]?.best_scores || {};
         bestScores[mode] = score;
-        await pool.query('UPDATE users SET best_scores = $1, best_score = $2 WHERE id = $3', [JSON.stringify(bestScores), score, id]);
+        // best_score も最大値で更新
+        const allScores = Object.values(bestScores).filter(v => typeof v === 'number');
+        const maxScore = allScores.length > 0 ? Math.max(...allScores) : 0;
+        await pool.query(
+          'UPDATE users SET best_scores = $1, best_score = $2 WHERE id = $3',
+          [JSON.stringify(bestScores), maxScore, id]
+        );
         result = `✅ ${mode}モードのベストスコアを ${score} に設定しました。`;
         break;
       }
@@ -522,45 +536,7 @@ app.post('/api/admin/command', async (req, res) => {
   }
 });
 
-// ===================== 管理者API =====================
-app.post('/api/admin/coins', async (req, res) => {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ error: '認証が必要です' });
-  try {
-    const { id } = jwt.verify(token, JWT_SECRET);
-    if (id !== 'admin') return res.status(403).json({ error: '管理者権限がありません' });
-    const { coins } = req.body;
-    if (typeof coins !== 'number' || coins < 0) {
-      return res.status(400).json({ error: '正しいコイン数を指定してください' });
-    }
-    await pool.query('UPDATE users SET coins = $1 WHERE id = $2', [coins, id]);
-    res.json({ success: true, coins });
-  } catch (err) {
-    res.status(401).json({ error: '認証エラー' });
-  }
-});
-
-app.post('/api/admin/score', async (req, res) => {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ error: '認証が必要です' });
-  try {
-    const { id } = jwt.verify(token, JWT_SECRET);
-    if (id !== 'admin') return res.status(403).json({ error: '管理者権限がありません' });
-    const { bestScore } = req.body;
-    if (typeof bestScore !== 'number' || bestScore < 0) {
-      return res.status(400).json({ error: '正しいスコアを指定してください' });
-    }
-    // best_scores も更新（焼成モードとして保存）
-    const userResult = await pool.query('SELECT best_scores FROM users WHERE id = $1', [id]);
-    let bestScores = userResult.rows[0]?.best_scores || {};
-    bestScores['baked'] = bestScore;
-    await pool.query('UPDATE users SET best_score = $1, best_scores = $2 WHERE id = $3', [bestScore, JSON.stringify(bestScores), id]);
-    res.json({ success: true, bestScore });
-  } catch (err) {
-    res.status(401).json({ error: '認証エラー' });
-  }
-});
-
+// ===================== 管理者API（block-settingsのみ） =====================
 app.get('/api/admin/block-settings', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: '認証が必要です' });
@@ -593,23 +569,6 @@ app.post('/api/admin/block-toggle', async (req, res) => {
     }
     await pool.query('UPDATE users SET admin_settings = $1 WHERE id = $2', [JSON.stringify(settings), id]);
     res.json({ success: true, settings });
-  } catch (err) {
-    res.status(401).json({ error: '認証エラー' });
-  }
-});
-
-app.post('/api/admin/safety-toggle', async (req, res) => {
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) return res.status(401).json({ error: '認証が必要です' });
-  try {
-    const { id } = jwt.verify(token, JWT_SECRET);
-    if (id !== 'admin') return res.status(403).json({ error: '管理者権限がありません' });
-    const { safetyMode } = req.body;
-    const result = await pool.query('SELECT admin_settings FROM users WHERE id = $1', [id]);
-    let settings = result.rows[0]?.admin_settings || { disabledBlocks: [], safetyMode: false };
-    settings.safetyMode = !!safetyMode;
-    await pool.query('UPDATE users SET admin_settings = $1 WHERE id = $2', [JSON.stringify(settings), id]);
-    res.json({ success: true, safetyMode: settings.safetyMode });
   } catch (err) {
     res.status(401).json({ error: '認証エラー' });
   }
