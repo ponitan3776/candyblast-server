@@ -54,6 +54,7 @@ pool.query(`
     skins TEXT DEFAULT '["default"]',
     equipped_skin TEXT DEFAULT 'default',
     quests TEXT DEFAULT '[]',
+    quest_progress JSONB DEFAULT '{}',
     admin_settings JSONB DEFAULT '{"disabledBlocks":[],"safetyMode":false}',
     last_login TIMESTAMP,
     created_at TIMESTAMP DEFAULT NOW()
@@ -262,9 +263,76 @@ app.get('/api/ranking', async (req, res) => {
   }
 });
 
+// ===================== クエスト管理API =====================
+
+app.get('/api/quests/progress', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: '認証が必要です' });
+  try {
+    const { id } = jwt.verify(token, JWT_SECRET);
+    const result = await pool.query('SELECT quest_progress FROM users WHERE id = $1', [id]);
+    const progress = result.rows[0]?.quest_progress || {};
+    res.json({ progress });
+  } catch (err) {
+    res.status(401).json({ error: '認証エラー' });
+  }
+});
+
+app.post('/api/quests/update', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: '認証が必要です' });
+  try {
+    const { id } = jwt.verify(token, JWT_SECRET);
+    const { questId, progress, claimed } = req.body;
+    const result = await pool.query('SELECT quest_progress FROM users WHERE id = $1', [id]);
+    let questProgress = result.rows[0]?.quest_progress || {};
+    questProgress[questId] = { progress, claimed: claimed || false };
+    await pool.query('UPDATE users SET quest_progress = $1 WHERE id = $2', [JSON.stringify(questProgress), id]);
+    res.json({ success: true, questProgress });
+  } catch (err) {
+    res.status(401).json({ error: '認証エラー' });
+  }
+});
+
+app.post('/api/quests/claim', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: '認証が必要です' });
+  try {
+    const { id } = jwt.verify(token, JWT_SECRET);
+    const { questId, reward } = req.body;
+    const result = await pool.query('SELECT quest_progress, coins FROM users WHERE id = $1', [id]);
+    let questProgress = result.rows[0]?.quest_progress || {};
+    const currentCoins = result.rows[0]?.coins || 0;
+    if (questProgress[questId]?.claimed) {
+      return res.status(400).json({ error: 'このクエストは既に受け取り済みです' });
+    }
+    const newCoins = currentCoins + reward;
+    questProgress[questId] = { progress: questProgress[questId]?.progress || 0, claimed: true };
+    await pool.query(
+      'UPDATE users SET quest_progress = $1, coins = $2 WHERE id = $3',
+      [JSON.stringify(questProgress), newCoins, id]
+    );
+    res.json({ success: true, coins: newCoins, questProgress });
+  } catch (err) {
+    res.status(401).json({ error: '認証エラー' });
+  }
+});
+
+app.post('/api/admin/reset-quests', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: '認証が必要です' });
+  try {
+    const { id } = jwt.verify(token, JWT_SECRET);
+    if (id !== 'admin') return res.status(403).json({ error: '管理者権限がありません' });
+    await pool.query('UPDATE users SET quest_progress = $1', [JSON.stringify({})]);
+    res.json({ success: true, message: '全ユーザーのクエスト進捗をリセットしました' });
+  } catch (err) {
+    res.status(401).json({ error: '認証エラー' });
+  }
+});
+
 // ===================== 管理者API =====================
 
-// admin: コイン更新
 app.post('/api/admin/coins', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: '認証が必要です' });
@@ -282,7 +350,6 @@ app.post('/api/admin/coins', async (req, res) => {
   }
 });
 
-// admin: ベストスコア更新
 app.post('/api/admin/score', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: '認証が必要です' });
@@ -300,7 +367,6 @@ app.post('/api/admin/score', async (req, res) => {
   }
 });
 
-// admin: ブロック設定取得
 app.get('/api/admin/block-settings', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: '認証が必要です' });
@@ -315,7 +381,6 @@ app.get('/api/admin/block-settings', async (req, res) => {
   }
 });
 
-// admin: ブロックトグル
 app.post('/api/admin/block-toggle', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: '認証が必要です' });
@@ -339,7 +404,6 @@ app.post('/api/admin/block-toggle', async (req, res) => {
   }
 });
 
-// admin: セーフティトグル
 app.post('/api/admin/safety-toggle', async (req, res) => {
   const token = req.headers.authorization?.replace('Bearer ', '');
   if (!token) return res.status(401).json({ error: '認証が必要です' });
