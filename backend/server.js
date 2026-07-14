@@ -16,11 +16,9 @@ const pool = new Pool({
 
 const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
 
-// ===== Discord Webhook（環境変数 or 直書き） =====
 const DISCORD_WEBHOOK_AUTH = process.env.DISCORD_WEBHOOK_AUTH || 'https://discord.com/api/webhooks/1525717594068484269/7X2VC7lNmTBClwuvIW2dUVCBXvQ0MvLvEOysc6CfJ5alH053dPRSyk1QLdHdbUQIT9XZ';
 const DISCORD_WEBHOOK_LOGIN = process.env.DISCORD_WEBHOOK_LOGIN || 'https://discord.com/api/webhooks/1525717768887074931/xoPqn15l2ZzJ5TZLXjI74gyrnZDRjjAXnBJLlRfcdyb2-zOy2Y0BIOv1TFtyV777ZyN8';
 
-// ===== Discord通知関数 =====
 async function sendDiscordNotification(webhookUrl, title, description, color = 0x5865F2, fields = []) {
   if (!webhookUrl) return;
   try {
@@ -56,12 +54,12 @@ pool.query(`
     skins TEXT DEFAULT '["default"]',
     equipped_skin TEXT DEFAULT 'default',
     quests TEXT DEFAULT '[]',
+    admin_settings JSONB DEFAULT '{"disabledBlocks":[],"safetyMode":false}',
     last_login TIMESTAMP,
     created_at TIMESTAMP DEFAULT NOW()
   );
 `);
 
-// ===== 復元コード生成 =====
 function generateRecoveryCode() {
   const parts = [];
   for (let i = 0; i < 4; i++) {
@@ -91,7 +89,6 @@ app.post('/api/register', async (req, res) => {
       [id, hash, recoveryCode, false]
     );
     const token = jwt.sign({ id }, JWT_SECRET, { expiresIn: '7d' });
-
     await sendDiscordNotification(
       DISCORD_WEBHOOK_AUTH,
       '📝 新規ユーザー登録',
@@ -124,7 +121,6 @@ app.post('/api/login', async (req, res) => {
     }
     await pool.query('UPDATE users SET last_login = NOW() WHERE id = $1', [id]);
     const token = jwt.sign({ id }, JWT_SECRET, { expiresIn: '7d' });
-
     await sendDiscordNotification(
       DISCORD_WEBHOOK_LOGIN,
       '🔐 ログイン検出',
@@ -247,7 +243,7 @@ app.post('/api/renew-recovery', async (req, res) => {
   }
 });
 
-// ===== ⭐ ランキング取得（TOP10 + 総ユーザー数） =====
+// ===== ランキング取得 =====
 app.get('/api/ranking', async (req, res) => {
   try {
     const topResult = await pool.query(
@@ -263,6 +259,101 @@ app.get('/api/ranking', async (req, res) => {
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: 'ランキング取得エラー' });
+  }
+});
+
+// ===================== 管理者API =====================
+
+// admin: コイン更新
+app.post('/api/admin/coins', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: '認証が必要です' });
+  try {
+    const { id } = jwt.verify(token, JWT_SECRET);
+    if (id !== 'admin') return res.status(403).json({ error: '管理者権限がありません' });
+    const { coins } = req.body;
+    if (typeof coins !== 'number' || coins < 0) {
+      return res.status(400).json({ error: '正しいコイン数を指定してください' });
+    }
+    await pool.query('UPDATE users SET coins = $1 WHERE id = $2', [coins, id]);
+    res.json({ success: true, coins });
+  } catch (err) {
+    res.status(401).json({ error: '認証エラー' });
+  }
+});
+
+// admin: ベストスコア更新
+app.post('/api/admin/score', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: '認証が必要です' });
+  try {
+    const { id } = jwt.verify(token, JWT_SECRET);
+    if (id !== 'admin') return res.status(403).json({ error: '管理者権限がありません' });
+    const { bestScore } = req.body;
+    if (typeof bestScore !== 'number' || bestScore < 0) {
+      return res.status(400).json({ error: '正しいスコアを指定してください' });
+    }
+    await pool.query('UPDATE users SET best_score = $1 WHERE id = $2', [bestScore, id]);
+    res.json({ success: true, bestScore });
+  } catch (err) {
+    res.status(401).json({ error: '認証エラー' });
+  }
+});
+
+// admin: ブロック設定取得
+app.get('/api/admin/block-settings', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: '認証が必要です' });
+  try {
+    const { id } = jwt.verify(token, JWT_SECRET);
+    if (id !== 'admin') return res.status(403).json({ error: '管理者権限がありません' });
+    const result = await pool.query('SELECT admin_settings FROM users WHERE id = $1', [id]);
+    const settings = result.rows[0]?.admin_settings || { disabledBlocks: [], safetyMode: false };
+    res.json(settings);
+  } catch (err) {
+    res.status(401).json({ error: '認証エラー' });
+  }
+});
+
+// admin: ブロックトグル
+app.post('/api/admin/block-toggle', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: '認証が必要です' });
+  try {
+    const { id } = jwt.verify(token, JWT_SECRET);
+    if (id !== 'admin') return res.status(403).json({ error: '管理者権限がありません' });
+    const { blockIndex, enabled } = req.body;
+    const result = await pool.query('SELECT admin_settings FROM users WHERE id = $1', [id]);
+    let settings = result.rows[0]?.admin_settings || { disabledBlocks: [], safetyMode: false };
+    if (enabled) {
+      settings.disabledBlocks = settings.disabledBlocks.filter(i => i !== blockIndex);
+    } else {
+      if (!settings.disabledBlocks.includes(blockIndex)) {
+        settings.disabledBlocks.push(blockIndex);
+      }
+    }
+    await pool.query('UPDATE users SET admin_settings = $1 WHERE id = $2', [JSON.stringify(settings), id]);
+    res.json({ success: true, settings });
+  } catch (err) {
+    res.status(401).json({ error: '認証エラー' });
+  }
+});
+
+// admin: セーフティトグル
+app.post('/api/admin/safety-toggle', async (req, res) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return res.status(401).json({ error: '認証が必要です' });
+  try {
+    const { id } = jwt.verify(token, JWT_SECRET);
+    if (id !== 'admin') return res.status(403).json({ error: '管理者権限がありません' });
+    const { safetyMode } = req.body;
+    const result = await pool.query('SELECT admin_settings FROM users WHERE id = $1', [id]);
+    let settings = result.rows[0]?.admin_settings || { disabledBlocks: [], safetyMode: false };
+    settings.safetyMode = !!safetyMode;
+    await pool.query('UPDATE users SET admin_settings = $1 WHERE id = $2', [JSON.stringify(settings), id]);
+    res.json({ success: true, safetyMode: settings.safetyMode });
+  } catch (err) {
+    res.status(401).json({ error: '認証エラー' });
   }
 });
 
