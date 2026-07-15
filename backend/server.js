@@ -56,19 +56,15 @@ pool.query(`
 const authRoutes = require('./routes/auth');
 const userRoutes = require('./routes/user');
 const rankingRoutes = require('./routes/ranking');
+const adminRoutes = require('./routes/admin');
+const chatRoutes = require('./routes/chat');
 
 // ===================== ルートをマウント =====================
 app.use('/api', authRoutes);
 app.use('/api', userRoutes);
 app.use('/api', rankingRoutes);
-
-// ===================== 管理者API（まだ分割しない） =====================
-// 今は server.js にそのまま残してもOK
-// 後で admin.js に分割する
-
-// ===================== チャットAPI（まだ分割しない） =====================
-// 今は server.js にそのまま残してもOK
-// 後で chat.js に分割する
+app.use('/api', adminRoutes);
+app.use('/api', chatRoutes);
 
 // ===================== サーバー起動 =====================
 const PORT = process.env.PORT || 3000;
