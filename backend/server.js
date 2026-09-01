@@ -40,82 +40,76 @@ async function sendDiscordNotification(webhookUrl, title, description, color = 0
   }
 }
 
-// ===================== テーブル作成 =====================
-pool.query(`
-  CREATE TABLE IF NOT EXISTS users (
-    id TEXT PRIMARY KEY,
-    password_hash TEXT NOT NULL,
-    recovery_code TEXT,
-    recovery_code_used BOOLEAN DEFAULT FALSE,
-    best_score INTEGER DEFAULT 0,
-    coins INTEGER DEFAULT 0,
-    skins TEXT DEFAULT '["default"]',
-    equipped_skin TEXT DEFAULT 'default',
-    quests TEXT DEFAULT '[]',
-    last_login TIMESTAMP,
-    created_at TIMESTAMP DEFAULT NOW()
-  );
-`);
+// ===================== テーブル作成（起動時に順番に実行） =====================
+// 以前は4つの pool.query() を並列に投げていたため、
+// 「users テーブルがまだ存在しないのに ALTER TABLE users が先に実行される」
+// という競合が起き、Renderの起動ログにエラーが出る原因になっていました。
+// ここでは await で順番に実行し、失敗時もサーバーが落ちないようにします。
+async function initDb() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id TEXT PRIMARY KEY,
+      password_hash TEXT NOT NULL,
+      recovery_code TEXT,
+      recovery_code_used BOOLEAN DEFAULT FALSE,
+      best_score INTEGER DEFAULT 0,
+      coins INTEGER DEFAULT 0,
+      skins TEXT DEFAULT '["default"]',
+      equipped_skin TEXT DEFAULT 'default',
+      quests TEXT DEFAULT '[]',
+      last_login TIMESTAMP,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
 
-// ===================== カラム自動追加 =====================
-pool.query(`
-  ALTER TABLE users ADD COLUMN IF NOT EXISTS best_scores JSONB DEFAULT '{}';
-  ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_settings JSONB DEFAULT '{"disabledBlocks":[],"safetyMode":false}';
-  ALTER TABLE users ADD COLUMN IF NOT EXISTS quest_progress JSONB DEFAULT '{}';
-  ALTER TABLE users ADD COLUMN IF NOT EXISTS banned BOOLEAN DEFAULT FALSE;
-  ALTER TABLE users ADD COLUMN IF NOT EXISTS play_time INTEGER DEFAULT 0;
-`).then(() => {
-  console.log('✅ カラム追加完了');
-}).catch(err => {
-  console.warn('⚠️ カラム追加:', err.message);
-});
+  await pool.query(`
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS best_scores JSONB DEFAULT '{}';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS admin_settings JSONB DEFAULT '{"disabledBlocks":[],"safetyMode":false}';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS quest_progress JSONB DEFAULT '{}';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS banned BOOLEAN DEFAULT FALSE;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS play_time INTEGER DEFAULT 0;
+  `);
+  console.log('✅ users テーブル準備完了');
 
-// ===================== チャットテーブル作成 =====================
-pool.query(`
-  CREATE TABLE IF NOT EXISTS chat_messages (
-    id SERIAL PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    message TEXT NOT NULL,
-    timestamp TIMESTAMP DEFAULT NOW()
-  );
-  CREATE INDEX IF NOT EXISTS idx_chat_timestamp ON chat_messages(timestamp);
-`).then(() => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS chat_messages (
+      id SERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      message TEXT NOT NULL,
+      timestamp TIMESTAMP DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_chat_timestamp ON chat_messages(timestamp);
+  `);
   console.log('✅ チャットテーブル作成完了');
-}).catch(err => {
-  console.warn('⚠️ チャットテーブル:', err.message);
-});
 
-// ===================== フレンド／DMテーブル作成 =====================
-pool.query(`
-  CREATE TABLE IF NOT EXISTS friend_requests (
-    id SERIAL PRIMARY KEY,
-    from_id TEXT NOT NULL,
-    to_id TEXT NOT NULL,
-    status TEXT DEFAULT 'pending',
-    created_at TIMESTAMP DEFAULT NOW(),
-    UNIQUE(from_id, to_id)
-  );
-  CREATE TABLE IF NOT EXISTS friends (
-    id SERIAL PRIMARY KEY,
-    user_id TEXT NOT NULL,
-    friend_id TEXT NOT NULL,
-    created_at TIMESTAMP DEFAULT NOW(),
-    UNIQUE(user_id, friend_id)
-  );
-  CREATE TABLE IF NOT EXISTS dm_messages (
-    id SERIAL PRIMARY KEY,
-    from_id TEXT NOT NULL,
-    to_id TEXT NOT NULL,
-    message TEXT NOT NULL,
-    is_read BOOLEAN DEFAULT FALSE,
-    timestamp TIMESTAMP DEFAULT NOW()
-  );
-  CREATE INDEX IF NOT EXISTS idx_dm_pair ON dm_messages(from_id, to_id);
-`).then(() => {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS friend_requests (
+      id SERIAL PRIMARY KEY,
+      from_id TEXT NOT NULL,
+      to_id TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(from_id, to_id)
+    );
+    CREATE TABLE IF NOT EXISTS friends (
+      id SERIAL PRIMARY KEY,
+      user_id TEXT NOT NULL,
+      friend_id TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(user_id, friend_id)
+    );
+    CREATE TABLE IF NOT EXISTS dm_messages (
+      id SERIAL PRIMARY KEY,
+      from_id TEXT NOT NULL,
+      to_id TEXT NOT NULL,
+      message TEXT NOT NULL,
+      is_read BOOLEAN DEFAULT FALSE,
+      timestamp TIMESTAMP DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_dm_pair ON dm_messages(from_id, to_id);
+  `);
   console.log('✅ フレンド／DMテーブル作成完了');
-}).catch(err => {
-  console.warn('⚠️ フレンド／DMテーブル:', err.message);
-});
+}
 
 function generateRecoveryCode() {
   const parts = [];
@@ -889,4 +883,22 @@ app.get('/api/user/profile/:userId', async (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+
+// DATABASE_URL が設定されていない場合、pool.query は全て失敗するので
+// 起動時にすぐ気づけるよう明示的にチェックしておく
+if (!process.env.DATABASE_URL) {
+  console.error('❌ 環境変数 DATABASE_URL が設定されていません。RenderのEnvironmentタブで設定してください。');
+}
+
+initDb()
+  .then(() => {
+    console.log('✅ データベース初期化完了');
+  })
+  .catch(err => {
+    // テーブル作成に失敗しても、原因（大抵はDATABASE_URLかSSL設定）が
+    // ログに残るようにしつつ、プロセス自体は落とさない
+    console.error('❌ データベース初期化エラー:', err.message);
+  })
+  .finally(() => {
+    app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+  });
