@@ -68,6 +68,7 @@ async function initDb() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS quest_progress JSONB DEFAULT '{}';
     ALTER TABLE users ADD COLUMN IF NOT EXISTS banned BOOLEAN DEFAULT FALSE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS play_time INTEGER DEFAULT 0;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active TIMESTAMP;
   `);
   console.log('✅ users テーブル準備完了');
 
@@ -109,6 +110,15 @@ async function initDb() {
     CREATE INDEX IF NOT EXISTS idx_dm_pair ON dm_messages(from_id, to_id);
   `);
   console.log('✅ フレンド／DMテーブル作成完了');
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS announcements (
+      id SERIAL PRIMARY KEY,
+      message TEXT NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  console.log('✅ お知らせテーブル作成完了');
 }
 
 function generateRecoveryCode() {
@@ -268,6 +278,8 @@ app.get('/api/sync', async (req, res) => {
   if (!token) return res.status(401).json({ error: '認証が必要です' });
   try {
     const { id } = jwt.verify(token, JWT_SECRET);
+    // このポーリング(5秒おき)自体をオンライン状態のハートビートとして使う
+    pool.query('UPDATE users SET last_active = NOW() WHERE id = $1', [id]).catch(()=>{});
     const result = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
     if (result.rows.length === 0) return res.status(404).json({ error: 'ユーザーが見つかりません' });
     const user = result.rows[0];
@@ -282,6 +294,17 @@ app.get('/api/sync', async (req, res) => {
     });
   } catch (err) {
     res.status(401).json({ error: '認証エラー' });
+  }
+});
+
+// ===================== サーバーお知らせ(管理者コマンドから配信) =====================
+app.get('/api/announcements/latest', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT id, message, created_at FROM announcements ORDER BY id DESC LIMIT 1');
+    if (result.rows.length === 0) return res.json({ announcement: null });
+    res.json({ announcement: result.rows[0] });
+  } catch (err) {
+    res.json({ announcement: null });
   }
 });
 
@@ -552,7 +575,9 @@ app.get('/api/friends/list', async (req, res) => {
   try {
     const id = requireAuth(req);
     const friendsResult = await pool.query(
-      `SELECT u.id, u.best_score, u.coins FROM friends f JOIN users u ON u.id = f.friend_id WHERE f.user_id = $1 ORDER BY u.id`,
+      `SELECT u.id, u.best_score, u.coins,
+        (u.last_active IS NOT NULL AND u.last_active > NOW() - INTERVAL '20 seconds') AS online
+       FROM friends f JOIN users u ON u.id = f.friend_id WHERE f.user_id = $1 ORDER BY u.id`,
       [id]
     );
     const incoming = await pool.query(
@@ -745,6 +770,13 @@ app.post('/api/admin/command', async (req, res) => {
         result = `🔍 ユーザー情報:\nID: ${u.id}\n🏆 ベストスコア: ${u.best_score}\n🪙 コイン: ${u.coins}\n⏱️ プレイ時間: ${u.play_time || 0}秒\n🚫 BAN: ${u.banned ? 'BAN中' : 'なし'}\n📅 作成日: ${new Date(u.created_at).toLocaleString('ja-JP')}\n📅 最終ログイン: ${u.last_login ? new Date(u.last_login).toLocaleString('ja-JP') : 'なし'}`;
         break;
       }
+      case '/announce': {
+        const message = args.join(' ');
+        if (!message) throw new Error('使用法: /announce <メッセージ>');
+        await pool.query('INSERT INTO announcements (message) VALUES ($1)', [message]);
+        result = `📢 全ユーザーにお知らせを配信しました:\n「${message}」`;
+        break;
+      }
       case '/stats': {
         const totalUsers = await pool.query('SELECT COUNT(*) FROM users');
         const totalScore = await pool.query('SELECT SUM(best_score) FROM users');
@@ -759,6 +791,7 @@ app.post('/api/admin/command', async (req, res) => {
   /setcoins <ユーザーID> <amount> - 指定ユーザーのコインを設定
   /setscore <ユーザーID> <mode> <score> - 指定ユーザーのモード別スコア設定 (soft, baked, hard, extreme)
   /safety [on|off] - 強制セーフティモード（引数なしで状態表示）
+  /announce <メッセージ> - 全ユーザーにお知らせを配信
   /resetquests - 全ユーザーのクエスト進捗リセット
   /setplaytime <seconds> - プレイ時間を設定
   /ban <ID> - ユーザーをBAN
