@@ -119,6 +119,20 @@ async function initDb() {
     );
   `);
   console.log('✅ お知らせテーブル作成完了');
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS duels (
+      id SERIAL PRIMARY KEY,
+      challenger_id TEXT NOT NULL,
+      opponent_id TEXT NOT NULL,
+      status TEXT DEFAULT 'pending',
+      duration INTEGER DEFAULT 60,
+      challenger_score INTEGER,
+      opponent_score INTEGER,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  console.log('✅ 対決(デュエル)テーブル作成完了');
 }
 
 function generateRecoveryCode() {
@@ -589,6 +603,77 @@ app.get('/api/friends/list', async (req, res) => {
       [id]
     );
     res.json({ friends: friendsResult.rows, incoming: incoming.rows, outgoing: outgoing.rows });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'サーバーエラー' });
+  }
+});
+
+// ===================== 🆕 フレンド対決(デュエル) =====================
+app.post('/api/duels/challenge', async (req, res) => {
+  try {
+    const id = requireAuth(req);
+    const { opponentId } = req.body;
+    if (!opponentId) { const e = new Error('対戦相手を指定してください'); e.status = 400; throw e; }
+    if (!(await areFriends(id, opponentId))) { const e = new Error('フレンドのみ対決できます'); e.status = 403; throw e; }
+    const result = await pool.query(
+      `INSERT INTO duels (challenger_id, opponent_id) VALUES ($1, $2) RETURNING *`,
+      [id, opponentId]
+    );
+    res.json({ duel: result.rows[0] });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'サーバーエラー' });
+  }
+});
+
+app.post('/api/duels/:id/respond', async (req, res) => {
+  try {
+    const id = requireAuth(req);
+    const { accept } = req.body;
+    const duelId = req.params.id;
+    const duelResult = await pool.query('SELECT * FROM duels WHERE id=$1', [duelId]);
+    const duel = duelResult.rows[0];
+    if (!duel) { const e = new Error('対決が見つかりません'); e.status = 404; throw e; }
+    if (duel.opponent_id !== id) { const e = new Error('権限がありません'); e.status = 403; throw e; }
+    const newStatus = accept ? 'accepted' : 'declined';
+    await pool.query('UPDATE duels SET status=$1 WHERE id=$2', [newStatus, duelId]);
+    res.json({ ok: true, status: newStatus });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'サーバーエラー' });
+  }
+});
+
+app.get('/api/duels/list', async (req, res) => {
+  try {
+    const id = requireAuth(req);
+    const result = await pool.query(
+      `SELECT * FROM duels WHERE challenger_id=$1 OR opponent_id=$1 ORDER BY created_at DESC LIMIT 30`,
+      [id]
+    );
+    res.json({ duels: result.rows });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'サーバーエラー' });
+  }
+});
+
+app.post('/api/duels/:id/submit-score', async (req, res) => {
+  try {
+    const id = requireAuth(req);
+    const { score } = req.body;
+    const duelId = req.params.id;
+    const duelResult = await pool.query('SELECT * FROM duels WHERE id=$1', [duelId]);
+    const duel = duelResult.rows[0];
+    if (!duel) { const e = new Error('対決が見つかりません'); e.status = 404; throw e; }
+    if (duel.challenger_id !== id && duel.opponent_id !== id) { const e = new Error('権限がありません'); e.status = 403; throw e; }
+    if (duel.status !== 'accepted' && duel.status !== 'completed') { const e = new Error('この対決はまだ受諾されていません'); e.status = 400; throw e; }
+    const column = duel.challenger_id === id ? 'challenger_score' : 'opponent_score';
+    await pool.query(`UPDATE duels SET ${column} = $1 WHERE id = $2`, [score, duelId]);
+    const updated = await pool.query('SELECT * FROM duels WHERE id=$1', [duelId]);
+    const d = updated.rows[0];
+    if (d.challenger_score !== null && d.opponent_score !== null && d.status !== 'completed') {
+      await pool.query(`UPDATE duels SET status='completed' WHERE id=$1`, [duelId]);
+      d.status = 'completed';
+    }
+    res.json({ duel: d });
   } catch (err) {
     res.status(err.status || 500).json({ error: err.message || 'サーバーエラー' });
   }
