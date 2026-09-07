@@ -7,7 +7,7 @@ require('dotenv').config();
 
 const app = express();
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '12mb' })); // 不具合報告に画像(base64)を添付できるようにするため上限を拡大
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
@@ -18,6 +18,8 @@ const JWT_SECRET = process.env.JWT_SECRET || 'your-secret-key';
 
 const DISCORD_WEBHOOK_AUTH = process.env.DISCORD_WEBHOOK_AUTH || '';
 const DISCORD_WEBHOOK_LOGIN = process.env.DISCORD_WEBHOOK_LOGIN || '';
+const DISCORD_WEBHOOK_FEATURE_REQUEST = process.env.DISCORD_WEBHOOK_FEATURE_REQUEST || 'https://discord.com/api/webhooks/1546488875810164736/gLYm0_WRcHPplCzzTPQopBc4t0O5QqLmQx8q4MOZN9qQHjETpmwmi0jRHMgEWlQVPRC3';
+const DISCORD_WEBHOOK_BUG_REPORT = process.env.DISCORD_WEBHOOK_BUG_REPORT || 'https://discord.com/api/webhooks/1546490249239334943/LTkNUk1oAk3jERMQRZMY9J5P9LaF7LbR2566ngGxJrct-OK7r0XTHnIcFvfaQi_641SD';
 
 async function sendDiscordNotification(webhookUrl, title, description, color = 0x5865F2, fields = []) {
   if (!webhookUrl) return;
@@ -559,6 +561,61 @@ async function runEventScheduler() {
   }
 }
 setInterval(runEventScheduler, 60 * 1000);
+
+// ===================== 🆕 ご要望・不具合報告(Discordへ転送) =====================
+function getUserIdFromTokenOptional(req) {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  if (!token) return 'ゲスト';
+  try { return jwt.verify(token, JWT_SECRET).id; } catch (err) { return 'ゲスト'; }
+}
+
+app.post('/api/feedback/request', async (req, res) => {
+  try {
+    const { message } = req.body;
+    if (!message || !message.trim()) return res.status(400).json({ error: 'メッセージを入力してください' });
+    const userId = getUserIdFromTokenOptional(req);
+    await sendDiscordNotification(
+      DISCORD_WEBHOOK_FEATURE_REQUEST,
+      '💡 新しいご要望',
+      message.trim().slice(0, 3800),
+      0xFFD93D,
+      [{ name: '送信者', value: userId, inline: true }]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('要望送信エラー:', err.message);
+    res.status(500).json({ error: '送信に失敗しました' });
+  }
+});
+
+app.post('/api/feedback/report', async (req, res) => {
+  try {
+    const { message, imageBase64 } = req.body;
+    if (!message || !message.trim()) return res.status(400).json({ error: 'メッセージを入力してください' });
+    const userId = getUserIdFromTokenOptional(req);
+    let imageBuffer = null;
+    if (imageBase64) {
+      const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, '');
+      imageBuffer = Buffer.from(base64Data, 'base64');
+      if (imageBuffer.length > 8 * 1024 * 1024) {
+        return res.status(400).json({ error: '画像サイズが大きすぎます（8MBまで）' });
+      }
+    }
+    await sendDiscordNotification(
+      DISCORD_WEBHOOK_BUG_REPORT,
+      '🐞 不具合の報告',
+      message.trim().slice(0, 3800),
+      0xFF5555,
+      [{ name: '報告者', value: userId, inline: true }],
+      imageBuffer,
+      'report.png'
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('報告送信エラー:', err.message);
+    res.status(500).json({ error: '送信に失敗しました' });
+  }
+});
 
 // ===================== クエスト管理API =====================
 app.get('/api/quests/progress', async (req, res) => {
