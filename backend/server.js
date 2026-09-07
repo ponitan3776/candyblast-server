@@ -69,6 +69,8 @@ async function initDb() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS banned BOOLEAN DEFAULT FALSE;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS play_time INTEGER DEFAULT 0;
     ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active TIMESTAMP;
+    ALTER TABLE users ALTER COLUMN coins TYPE BIGINT;
+    ALTER TABLE users ALTER COLUMN best_score TYPE BIGINT;
   `);
   console.log('✅ users テーブル準備完了');
 
@@ -142,7 +144,12 @@ async function initDb() {
       rank_position INTEGER NOT NULL,
       reward_coins INTEGER NOT NULL,
       last_triggered_date TEXT,
-      created_at TIMESTAMP DEFAULT NOW()
+      created_at TIMESTAMP DEFAULT NOW(),
+      recurrence TEXT DEFAULT 'daily',
+      minute_jst INTEGER DEFAULT 0,
+      event_year INTEGER,
+      event_month INTEGER,
+      event_day INTEGER
     );
   `);
   console.log('✅ スケジュールイベントテーブル作成完了');
@@ -227,7 +234,7 @@ app.post('/api/login', async (req, res) => {
       id,
       bestScore: user.best_score,
       bestScores: user.best_scores || {},
-      coins: user.coins,
+      coins: Number(user.coins),
       playTime: user.play_time || 0,
       lastLogin: user.last_login
     });
@@ -313,7 +320,7 @@ app.get('/api/sync', async (req, res) => {
     res.json({
       bestScore: user.best_score,
       bestScores: user.best_scores || {},
-      coins: user.coins,
+      coins: Number(user.coins),
       playTime: user.play_time || 0,
       skins: JSON.parse(user.skins || '["default"]'),
       equippedSkin: user.equipped_skin || 'default',
@@ -449,40 +456,85 @@ function jstDateKey(d) {
 }
 
 // イベント一覧(次回発生時刻を計算して返す。ログイン不要で誰でも見られる)
+function computeNextTrigger(e, jstNow) {
+  const next = new Date(jstNow);
+  next.setSeconds(0, 0);
+  if (e.recurrence === 'once') {
+    next.setFullYear(e.event_year, (e.event_month || 1) - 1, e.event_day || 1);
+    next.setHours(e.hour_jst, e.minute_jst || 0, 0, 0);
+    if (next <= jstNow) return null; // 過去の日時なら次回なし
+    return next;
+  }
+  if (e.recurrence === 'daily') {
+    next.setHours(e.hour_jst, e.minute_jst || 0, 0, 0);
+    if (next <= jstNow) next.setDate(next.getDate() + 1);
+    return next;
+  }
+  if (e.recurrence === 'weekly') {
+    next.setHours(e.hour_jst, e.minute_jst || 0, 0, 0);
+    let diff = (e.event_day - jstNow.getDay() + 7) % 7;
+    if (diff === 0 && next <= jstNow) diff = 7;
+    next.setDate(next.getDate() + diff);
+    return next;
+  }
+  if (e.recurrence === 'monthly') {
+    next.setDate(e.event_day);
+    next.setHours(e.hour_jst, e.minute_jst || 0, 0, 0);
+    if (next <= jstNow) next.setMonth(next.getMonth() + 1);
+    return next;
+  }
+  return null;
+}
+
 app.get('/api/events/list', async (req, res) => {
   try {
-    const result = await pool.query('SELECT * FROM scheduled_events ORDER BY hour_jst');
+    const result = await pool.query('SELECT * FROM scheduled_events ORDER BY id');
     const jstNow = getJSTNow();
     const events = result.rows.map(e => {
-      // 次にこのイベントが発生するJST日時を計算
-      const next = new Date(jstNow);
-      next.setHours(e.hour_jst, 0, 0, 0);
-      if (next <= jstNow) next.setDate(next.getDate() + 1);
-      const msUntilJST = next.getTime() - jstNow.getTime();
+      const next = computeNextTrigger(e, jstNow);
+      const secondsUntilNext = next ? Math.round((next.getTime() - jstNow.getTime()) / 1000) : null;
       return {
         id: e.id,
+        recurrence: e.recurrence,
         hourJst: e.hour_jst,
+        minuteJst: e.minute_jst || 0,
+        eventYear: e.event_year,
+        eventMonth: e.event_month,
+        eventDay: e.event_day,
         rankingMode: e.ranking_mode,
         rankPosition: e.rank_position,
         rewardCoins: e.reward_coins,
-        secondsUntilNext: Math.round(msUntilJST / 1000)
+        secondsUntilNext
       };
-    });
+    }).filter(e => e.secondsUntilNext !== null); // 過去の一度きりイベントなどは表示しない
     res.json({ events });
   } catch (err) {
     res.json({ events: [] });
   }
 });
 
-// 毎分チェックし、該当時刻(JST)になったイベントの報酬を自動配布する
+// 毎分チェックし、該当日時(JST)になったイベントの報酬を自動配布する
 async function runEventScheduler() {
   try {
     const jstNow = getJSTNow();
     const hour = jstNow.getHours();
+    const minute = jstNow.getMinutes();
     const dateKey = jstDateKey(jstNow);
-    const events = await pool.query('SELECT * FROM scheduled_events WHERE hour_jst = $1', [hour]);
+    const events = await pool.query('SELECT * FROM scheduled_events WHERE hour_jst = $1 AND minute_jst = $2', [hour, minute]);
     for (const ev of events.rows) {
-      if (ev.last_triggered_date === dateKey) continue; // 本日は配布済み
+      let shouldFire = false;
+      if (ev.recurrence === 'once') {
+        shouldFire = !ev.last_triggered_date &&
+          ev.event_year === jstNow.getFullYear() && ev.event_month === jstNow.getMonth() + 1 && ev.event_day === jstNow.getDate();
+      } else if (ev.recurrence === 'daily') {
+        shouldFire = ev.last_triggered_date !== dateKey;
+      } else if (ev.recurrence === 'weekly') {
+        shouldFire = jstNow.getDay() === ev.event_day && ev.last_triggered_date !== dateKey;
+      } else if (ev.recurrence === 'monthly') {
+        shouldFire = jstNow.getDate() === ev.event_day && ev.last_triggered_date !== dateKey;
+      }
+      if (!shouldFire) continue;
+
       const mode = ev.ranking_mode;
       const rankResult = await pool.query(
         `SELECT id FROM users
@@ -496,7 +548,11 @@ async function runEventScheduler() {
         await pool.query('UPDATE users SET coins = coins + $1 WHERE id = $2', [ev.reward_coins, target.id]);
         console.log(`🎁 イベント報酬配布: ${target.id} に ${ev.reward_coins}コイン（${mode}ランキング${ev.rank_position}位）`);
       }
-      await pool.query('UPDATE scheduled_events SET last_triggered_date = $1 WHERE id = $2', [dateKey, ev.id]);
+      if (ev.recurrence === 'once') {
+        await pool.query('DELETE FROM scheduled_events WHERE id = $1', [ev.id]); // 一度きりなので削除して二度と発火しない
+      } else {
+        await pool.query('UPDATE scheduled_events SET last_triggered_date = $1 WHERE id = $2', [dateKey, ev.id]);
+      }
     }
   } catch (err) {
     console.error('イベントスケジューラーエラー:', err.message);
@@ -848,7 +904,7 @@ app.post('/api/admin/command', async (req, res) => {
         if (isNaN(amount)) throw new Error('正しいコイン数を指定してください');
         const targetUser = await pool.query('SELECT coins FROM users WHERE id = $1', [targetId]);
         if (targetUser.rows.length === 0) throw new Error(`ユーザー ${targetId} は見つかりません`);
-        const newTotal = Math.max(0, (targetUser.rows[0].coins || 0) + amount);
+        const newTotal = Math.max(0, Number(targetUser.rows[0].coins || 0) + amount);
         await pool.query('UPDATE users SET coins = $1 WHERE id = $2', [newTotal, targetId]);
         result = `✅ ${targetId} のコインに ${amount} を加算しました（合計: ${newTotal}）。`;
         break;
@@ -962,30 +1018,52 @@ app.post('/api/admin/command', async (req, res) => {
         break;
       }
       case '/eventadd': {
-        // 使用法: /eventadd <時(0-23,日本時間)> <mode> <順位> <コイン>
-        if (args.length < 4) throw new Error('使用法: /eventadd <時(0-23,日本時間)> <mode> <順位> <コイン>');
-        const hourJst = parseInt(args[0]);
+        // 使用法: /eventadd <once|daily|weekly|monthly> <mode> <順位> <コイン> <年> <月> <日> <時> <分>
+        // once: 年月日時分をすべて指定(その日時に一度だけ発生)
+        // daily: 年月日は0でOK(時・分だけ使用、毎日発生)
+        // weekly: 「日」を曜日(0=日〜6=土)として使用。年月は0でOK
+        // monthly: 「日」を日付(1-31)として使用。年月は0でOK
+        if (args.length < 9) throw new Error('使用法: /eventadd <once|daily|weekly|monthly> <mode> <順位> <コイン> <年> <月> <日> <時> <分>\n例1) 一度だけ: /eventadd once baked 1 500 2026 12 25 20 0\n例2) 毎日: /eventadd daily baked 1 500 0 0 0 20 0\n例3) 毎週(3=水曜): /eventadd weekly baked 1 500 0 0 3 20 0\n例4) 毎月(15日): /eventadd monthly baked 1 500 0 0 15 20 0');
+        const recurrence = args[0].toLowerCase();
         const evMode = args[1];
         const rankPos = parseInt(args[2]);
         const rewardCoins = parseInt(args[3]);
+        const evYear = parseInt(args[4]);
+        const evMonth = parseInt(args[5]);
+        const evDay = parseInt(args[6]);
+        const hourJst = parseInt(args[7]);
+        const minuteJst = parseInt(args[8]);
         const validModes2 = ['soft', 'baked', 'hard', 'extreme', 'tetris', 'timeattack'];
-        if (isNaN(hourJst) || hourJst < 0 || hourJst > 23) throw new Error('時間は0〜23で指定してください（日本時間）');
+        const validRecurrence = ['once', 'daily', 'weekly', 'monthly'];
+        if (!validRecurrence.includes(recurrence)) throw new Error(`繰り返しは ${validRecurrence.join(', ')} のいずれかです`);
         if (!validModes2.includes(evMode)) throw new Error(`モードは ${validModes2.join(', ')} のいずれかです`);
         if (isNaN(rankPos) || rankPos < 1) throw new Error('順位は1以上で指定してください');
         if (isNaN(rewardCoins)) throw new Error('コイン数を指定してください');
+        if (isNaN(hourJst) || hourJst < 0 || hourJst > 23) throw new Error('時間は0〜23で指定してください（日本時間）');
+        if (isNaN(minuteJst) || minuteJst < 0 || minuteJst > 59) throw new Error('分は0〜59で指定してください');
+        if (recurrence === 'once' && (isNaN(evYear) || isNaN(evMonth) || isNaN(evDay))) throw new Error('onceの場合は年・月・日を正しく指定してください');
+        if (recurrence === 'weekly' && (isNaN(evDay) || evDay < 0 || evDay > 6)) throw new Error('weeklyの場合は「日」を曜日(0=日〜6=土)で指定してください');
+        if (recurrence === 'monthly' && (isNaN(evDay) || evDay < 1 || evDay > 31)) throw new Error('monthlyの場合は「日」を日付(1〜31)で指定してください');
         const evResult = await pool.query(
-          `INSERT INTO scheduled_events (hour_jst, ranking_mode, rank_position, reward_coins) VALUES ($1,$2,$3,$4) RETURNING *`,
-          [hourJst, evMode, rankPos, rewardCoins]
+          `INSERT INTO scheduled_events (recurrence, ranking_mode, rank_position, reward_coins, event_year, event_month, event_day, hour_jst, minute_jst)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,
+          [recurrence, evMode, rankPos, rewardCoins, evYear || null, evMonth || null, evDay || null, hourJst, minuteJst]
         );
-        result = `✅ イベントを追加しました（ID: ${evResult.rows[0].id}）: 毎日${hourJst}時(日本時間)に「${evMode}」ランキング${rankPos}位のユーザーへ${rewardCoins}コインを自動配布します。`;
+        result = `✅ イベントを追加しました（ID: ${evResult.rows[0].id}）: [${recurrence}] 「${evMode}」ランキング${rankPos}位へ${rewardCoins}コインを自動配布します。`;
         break;
       }
       case '/eventlist': {
-        const evList = await pool.query('SELECT * FROM scheduled_events ORDER BY hour_jst');
+        const evList = await pool.query('SELECT * FROM scheduled_events ORDER BY id');
         if (evList.rows.length === 0) { result = '登録されているイベントはありません。'; break; }
-        result = '📅 登録済みイベント一覧:\n' + evList.rows.map(e =>
-          `ID${e.id}: 毎日${e.hour_jst}時(JST) 「${e.ranking_mode}」${e.rank_position}位 → ${e.reward_coins}コイン`
-        ).join('\n');
+        result = '📅 登録済みイベント一覧:\n' + evList.rows.map(e => {
+          const timeStr = `${String(e.hour_jst).padStart(2,'0')}:${String(e.minute_jst||0).padStart(2,'0')}`;
+          let whenStr = '';
+          if (e.recurrence === 'once') whenStr = `${e.event_year}/${e.event_month}/${e.event_day} ${timeStr}に一度だけ`;
+          else if (e.recurrence === 'daily') whenStr = `毎日${timeStr}`;
+          else if (e.recurrence === 'weekly') whenStr = `毎週${['日','月','火','水','木','金','土'][e.event_day]}曜 ${timeStr}`;
+          else if (e.recurrence === 'monthly') whenStr = `毎月${e.event_day}日 ${timeStr}`;
+          return `ID${e.id}: ${whenStr}(JST) 「${e.ranking_mode}」${e.rank_position}位 → ${e.reward_coins}コイン`;
+        }).join('\n');
         break;
       }
       case '/eventremove': {
@@ -1003,7 +1081,7 @@ app.post('/api/admin/command', async (req, res) => {
   /setscore <ユーザーID> <mode> <score> - 指定ユーザーのモード別スコア設定 (soft, baked, hard, extreme, tetris, timeattack)
   /safety [on|off] - 強制セーフティモード（引数なしで状態表示）
   /announce <メッセージ> - 全ユーザーにお知らせを配信
-  /eventadd <時(0-23,JST)> <mode> <順位> <コイン> - 毎日その時刻にランキング順位者へコインを自動配布するイベントを追加
+  /eventadd <once|daily|weekly|monthly> <mode> <順位> <コイン> <年> <月> <日> <時> <分> - ランキング順位者へコインを自動配布するイベントを追加(JST基準)
   /eventlist - 登録済みイベント一覧を表示
   /eventremove <ID> - イベントを削除
   /resetquests - 全ユーザーのクエスト進捗リセット
@@ -1119,7 +1197,7 @@ app.get('/api/user/profile/:userId', async (req, res) => {
     res.json({
       userId: user.id,
       bestScore: user.best_score,
-      coins: user.coins,
+      coins: Number(user.coins),
       playTime: user.play_time || 0,
       joinedAt: user.created_at
     });
