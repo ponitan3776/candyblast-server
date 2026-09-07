@@ -133,6 +133,19 @@ async function initDb() {
     );
   `);
   console.log('✅ 対決(デュエル)テーブル作成完了');
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS scheduled_events (
+      id SERIAL PRIMARY KEY,
+      hour_jst INTEGER NOT NULL,
+      ranking_mode TEXT NOT NULL,
+      rank_position INTEGER NOT NULL,
+      reward_coins INTEGER NOT NULL,
+      last_triggered_date TEXT,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+  `);
+  console.log('✅ スケジュールイベントテーブル作成完了');
 }
 
 function generateRecoveryCode() {
@@ -426,6 +439,70 @@ app.get('/api/ranking', async (req, res) => {
     res.status(500).json({ error: 'ランキング取得エラー' });
   }
 });
+
+// ===================== 🆕 スケジュールイベント(自動報酬) =====================
+function getJSTNow() {
+  return new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Tokyo' }));
+}
+function jstDateKey(d) {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// イベント一覧(次回発生時刻を計算して返す。ログイン不要で誰でも見られる)
+app.get('/api/events/list', async (req, res) => {
+  try {
+    const result = await pool.query('SELECT * FROM scheduled_events ORDER BY hour_jst');
+    const jstNow = getJSTNow();
+    const events = result.rows.map(e => {
+      // 次にこのイベントが発生するJST日時を計算
+      const next = new Date(jstNow);
+      next.setHours(e.hour_jst, 0, 0, 0);
+      if (next <= jstNow) next.setDate(next.getDate() + 1);
+      const msUntilJST = next.getTime() - jstNow.getTime();
+      return {
+        id: e.id,
+        hourJst: e.hour_jst,
+        rankingMode: e.ranking_mode,
+        rankPosition: e.rank_position,
+        rewardCoins: e.reward_coins,
+        secondsUntilNext: Math.round(msUntilJST / 1000)
+      };
+    });
+    res.json({ events });
+  } catch (err) {
+    res.json({ events: [] });
+  }
+});
+
+// 毎分チェックし、該当時刻(JST)になったイベントの報酬を自動配布する
+async function runEventScheduler() {
+  try {
+    const jstNow = getJSTNow();
+    const hour = jstNow.getHours();
+    const dateKey = jstDateKey(jstNow);
+    const events = await pool.query('SELECT * FROM scheduled_events WHERE hour_jst = $1', [hour]);
+    for (const ev of events.rows) {
+      if (ev.last_triggered_date === dateKey) continue; // 本日は配布済み
+      const mode = ev.ranking_mode;
+      const rankResult = await pool.query(
+        `SELECT id FROM users
+         WHERE best_scores->>'${mode}' IS NOT NULL AND best_scores->>'${mode}' != '0'
+         ORDER BY (best_scores->>'${mode}')::int DESC
+         LIMIT 1 OFFSET $1`,
+        [ev.rank_position - 1]
+      );
+      const target = rankResult.rows[0];
+      if (target) {
+        await pool.query('UPDATE users SET coins = coins + $1 WHERE id = $2', [ev.reward_coins, target.id]);
+        console.log(`🎁 イベント報酬配布: ${target.id} に ${ev.reward_coins}コイン（${mode}ランキング${ev.rank_position}位）`);
+      }
+      await pool.query('UPDATE scheduled_events SET last_triggered_date = $1 WHERE id = $2', [dateKey, ev.id]);
+    }
+  } catch (err) {
+    console.error('イベントスケジューラーエラー:', err.message);
+  }
+}
+setInterval(runEventScheduler, 60 * 1000);
 
 // ===================== クエスト管理API =====================
 app.get('/api/quests/progress', async (req, res) => {
@@ -763,21 +840,35 @@ app.post('/api/admin/command', async (req, res) => {
         result = `✅ ${targetId} のコインを ${amount} に設定しました。`;
         break;
       }
+      case '/addcoins': {
+        // 使用法: /addcoins <ユーザーID> <amount> (元のコイン数に加算する)
+        if (args.length < 2) throw new Error('使用法: /addcoins <ユーザーID> <amount>');
+        const targetId = args[0];
+        const amount = parseInt(args[1]);
+        if (isNaN(amount)) throw new Error('正しいコイン数を指定してください');
+        const targetUser = await pool.query('SELECT coins FROM users WHERE id = $1', [targetId]);
+        if (targetUser.rows.length === 0) throw new Error(`ユーザー ${targetId} は見つかりません`);
+        const newTotal = Math.max(0, (targetUser.rows[0].coins || 0) + amount);
+        await pool.query('UPDATE users SET coins = $1 WHERE id = $2', [newTotal, targetId]);
+        result = `✅ ${targetId} のコインに ${amount} を加算しました（合計: ${newTotal}）。`;
+        break;
+      }
       case '/setscore': {
         // 使用法: /setscore <ユーザーID> <mode> <score>
         if (args.length < 3) throw new Error('使用法: /setscore <ユーザーID> <mode> <score>');
         const targetId = args[0];
         const mode = args[1];
         const score = parseInt(args[2]);
-        const validModes = ['soft', 'baked', 'hard', 'extreme'];
+        const validModes = ['soft', 'baked', 'hard', 'extreme', 'tetris', 'timeattack'];
         if (!validModes.includes(mode)) throw new Error(`モードは ${validModes.join(', ')} のいずれかです`);
         if (isNaN(score) || score < 0) throw new Error('正しいスコアを指定してください');
         const userResult = await pool.query('SELECT best_scores FROM users WHERE id = $1', [targetId]);
         if (userResult.rows.length === 0) throw new Error(`ユーザー ${targetId} は見つかりません`);
         let bestScores = userResult.rows[0]?.best_scores || {};
         bestScores[mode] = score;
-        const allScores = Object.values(bestScores).filter(v => typeof v === 'number');
-        const maxScore = allScores.length > 0 ? Math.max(...allScores) : 0;
+        const regularModes = ['soft', 'baked', 'hard', 'extreme'];
+        const regularScores = regularModes.map(m => bestScores[m]).filter(v => typeof v === 'number');
+        const maxScore = regularScores.length > 0 ? Math.max(...regularScores) : 0;
         await pool.query(
           'UPDATE users SET best_scores = $1, best_score = $2 WHERE id = $3',
           [JSON.stringify(bestScores), maxScore, targetId]
@@ -870,13 +961,51 @@ app.post('/api/admin/command', async (req, res) => {
         result = `📊 サーバー統計:\n👤 総ユーザー数: ${totalUsers.rows[0].count}\n🏆 総スコア: ${totalScore.rows[0].sum || 0}\n🪙 総コイン: ${totalCoins.rows[0].sum || 0}\n⏱️ 総プレイ時間: ${totalPlayTime.rows[0].sum || 0}秒`;
         break;
       }
+      case '/eventadd': {
+        // 使用法: /eventadd <時(0-23,日本時間)> <mode> <順位> <コイン>
+        if (args.length < 4) throw new Error('使用法: /eventadd <時(0-23,日本時間)> <mode> <順位> <コイン>');
+        const hourJst = parseInt(args[0]);
+        const evMode = args[1];
+        const rankPos = parseInt(args[2]);
+        const rewardCoins = parseInt(args[3]);
+        const validModes2 = ['soft', 'baked', 'hard', 'extreme', 'tetris', 'timeattack'];
+        if (isNaN(hourJst) || hourJst < 0 || hourJst > 23) throw new Error('時間は0〜23で指定してください（日本時間）');
+        if (!validModes2.includes(evMode)) throw new Error(`モードは ${validModes2.join(', ')} のいずれかです`);
+        if (isNaN(rankPos) || rankPos < 1) throw new Error('順位は1以上で指定してください');
+        if (isNaN(rewardCoins)) throw new Error('コイン数を指定してください');
+        const evResult = await pool.query(
+          `INSERT INTO scheduled_events (hour_jst, ranking_mode, rank_position, reward_coins) VALUES ($1,$2,$3,$4) RETURNING *`,
+          [hourJst, evMode, rankPos, rewardCoins]
+        );
+        result = `✅ イベントを追加しました（ID: ${evResult.rows[0].id}）: 毎日${hourJst}時(日本時間)に「${evMode}」ランキング${rankPos}位のユーザーへ${rewardCoins}コインを自動配布します。`;
+        break;
+      }
+      case '/eventlist': {
+        const evList = await pool.query('SELECT * FROM scheduled_events ORDER BY hour_jst');
+        if (evList.rows.length === 0) { result = '登録されているイベントはありません。'; break; }
+        result = '📅 登録済みイベント一覧:\n' + evList.rows.map(e =>
+          `ID${e.id}: 毎日${e.hour_jst}時(JST) 「${e.ranking_mode}」${e.rank_position}位 → ${e.reward_coins}コイン`
+        ).join('\n');
+        break;
+      }
+      case '/eventremove': {
+        if (args.length < 1) throw new Error('使用法: /eventremove <ID>');
+        const delResult = await pool.query('DELETE FROM scheduled_events WHERE id=$1 RETURNING *', [args[0]]);
+        if (delResult.rows.length === 0) throw new Error(`イベントID ${args[0]} は見つかりません`);
+        result = `✅ イベントID ${args[0]} を削除しました。`;
+        break;
+      }
       case '/help':
       default:
         result = `📋 使用可能なコマンド:
   /setcoins <ユーザーID> <amount> - 指定ユーザーのコインを設定
-  /setscore <ユーザーID> <mode> <score> - 指定ユーザーのモード別スコア設定 (soft, baked, hard, extreme)
+  /addcoins <ユーザーID> <amount> - 指定ユーザーのコインに加算（元のコイン+amount）
+  /setscore <ユーザーID> <mode> <score> - 指定ユーザーのモード別スコア設定 (soft, baked, hard, extreme, tetris, timeattack)
   /safety [on|off] - 強制セーフティモード（引数なしで状態表示）
   /announce <メッセージ> - 全ユーザーにお知らせを配信
+  /eventadd <時(0-23,JST)> <mode> <順位> <コイン> - 毎日その時刻にランキング順位者へコインを自動配布するイベントを追加
+  /eventlist - 登録済みイベント一覧を表示
+  /eventremove <ID> - イベントを削除
   /resetquests - 全ユーザーのクエスト進捗リセット
   /setplaytime <seconds> - プレイ時間を設定
   /ban <ID> - ユーザーをBAN
