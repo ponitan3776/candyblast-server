@@ -373,7 +373,7 @@ const GACHA_SKIN_IDS = ['gacha_cosmicdragon', 'gacha_celestialphoenix', 'gacha_v
 const GACHA_SKIN_ID_SET = new Set(GACHA_SKIN_IDS);
 const GACHA_COST = 2000;
 const GACHA_RATE_PER_SKIN = 0.005; 
-const GACHA_PITY_THRESHOLD = 500; 
+const GACHA_PITY_THRESHOLD = 100; 
 const GACHA_DUPLICATE_COINS = 500; // 被り時の還元コイン
 const GACHA_MISS_COINS = 30;       // ハズレ時の慰めコイン
 
