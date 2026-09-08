@@ -73,6 +73,9 @@ async function initDb() {
     ALTER TABLE users ADD COLUMN IF NOT EXISTS last_active TIMESTAMP;
     ALTER TABLE users ALTER COLUMN coins TYPE BIGINT;
     ALTER TABLE users ALTER COLUMN best_score TYPE BIGINT;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS gacha_state JSONB DEFAULT '{"totalPulls":0,"pityCounter":0}';
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS battlepass_xp INTEGER DEFAULT 0;
+    ALTER TABLE users ADD COLUMN IF NOT EXISTS battlepass_claimed JSONB DEFAULT '[]';
   `);
   console.log('✅ users テーブル準備完了');
 
@@ -146,15 +149,39 @@ async function initDb() {
       rank_position INTEGER NOT NULL,
       reward_coins INTEGER NOT NULL,
       last_triggered_date TEXT,
-      created_at TIMESTAMP DEFAULT NOW(),
-      recurrence TEXT DEFAULT 'daily',
-      minute_jst INTEGER DEFAULT 0,
-      event_year INTEGER,
-      event_month INTEGER,
-      event_day INTEGER
+      created_at TIMESTAMP DEFAULT NOW()
     );
   `);
+  // ↑ CREATE TABLE IF NOT EXISTS は「既にテーブルがある場合は何もしない」ため、
+  // 後から追加した列は下記のように ALTER TABLE で明示的に追加しないと反映されない。
+  // (これが原因で /eventadd がエラーになっていました)
+  await pool.query(`
+    ALTER TABLE scheduled_events ADD COLUMN IF NOT EXISTS recurrence TEXT DEFAULT 'daily';
+    ALTER TABLE scheduled_events ADD COLUMN IF NOT EXISTS minute_jst INTEGER DEFAULT 0;
+    ALTER TABLE scheduled_events ADD COLUMN IF NOT EXISTS event_year INTEGER;
+    ALTER TABLE scheduled_events ADD COLUMN IF NOT EXISTS event_month INTEGER;
+    ALTER TABLE scheduled_events ADD COLUMN IF NOT EXISTS event_day INTEGER;
+  `);
   console.log('✅ スケジュールイベントテーブル作成完了');
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS weekly_challenge (
+      id SERIAL PRIMARY KEY,
+      week_key TEXT UNIQUE NOT NULL,
+      mode TEXT NOT NULL,
+      size INTEGER NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW()
+    );
+    CREATE TABLE IF NOT EXISTS weekly_challenge_scores (
+      id SERIAL PRIMARY KEY,
+      week_key TEXT NOT NULL,
+      user_id TEXT NOT NULL,
+      score INTEGER NOT NULL,
+      created_at TIMESTAMP DEFAULT NOW(),
+      UNIQUE(week_key, user_id)
+    );
+  `);
+  console.log('✅ 週替わりチャレンジテーブル作成完了');
 }
 
 function generateRecoveryCode() {
@@ -279,8 +306,15 @@ app.post('/api/sync', async (req, res) => {
       values.push(coins || 0);
     }
     if (skins !== undefined) {
+      // ガチャ限定スキンはガチャAPI経由でのみ付与されるべきなので、
+      // クライアントが直接syncで追加してくることがないようサーバー側でも弾く
+      const existingSkinsRow = await pool.query('SELECT skins FROM users WHERE id = $1', [id]);
+      const existingSkins = JSON.parse(existingSkinsRow.rows[0]?.skins || '["default"]');
+      const safeSkins = (Array.isArray(skins) ? skins : []).filter(s =>
+        existingSkins.includes(s) || !GACHA_SKIN_ID_SET.has(s)
+      );
       updateFields.push(`skins = $${paramCount++}`);
-      values.push(JSON.stringify(skins));
+      values.push(JSON.stringify(safeSkins));
     }
     if (equippedSkin !== undefined) {
       updateFields.push(`equipped_skin = $${paramCount++}`);
@@ -334,6 +368,183 @@ app.get('/api/sync', async (req, res) => {
 });
 
 // ===================== サーバーお知らせ(管理者コマンドから配信) =====================
+// ===================== 🆕 ガチャ(限定スキン、低確率、天井あり) =====================
+const GACHA_SKIN_IDS = ['gacha_cosmicdragon', 'gacha_celestialphoenix', 'gacha_voidempress'];
+const GACHA_SKIN_ID_SET = new Set(GACHA_SKIN_IDS);
+const GACHA_COST = 300;
+const GACHA_RATE_PER_SKIN = 0.02; // 1種類あたり2%(3種で合計6%)
+const GACHA_PITY_THRESHOLD = 50;  // 天井: 50回以内に必ず1つ当たる
+const GACHA_DUPLICATE_COINS = 500; // 被り時の還元コイン
+const GACHA_MISS_COINS = 30;       // ハズレ時の慰めコイン
+
+app.get('/api/gacha/state', async (req, res) => {
+  try {
+    const id = requireAuth(req);
+    const result = await pool.query('SELECT coins, gacha_state, skins FROM users WHERE id=$1', [id]);
+    if (result.rows.length === 0) { const e = new Error('ユーザーが見つかりません'); e.status = 404; throw e; }
+    const u = result.rows[0];
+    const gachaState = u.gacha_state || { totalPulls: 0, pityCounter: 0 };
+    res.json({
+      coins: Number(u.coins),
+      totalPulls: gachaState.totalPulls || 0,
+      pityCounter: gachaState.pityCounter || 0,
+      pityThreshold: GACHA_PITY_THRESHOLD,
+      cost: GACHA_COST,
+      freeTickets: gachaState.freeTickets || 0,
+      ownedSkins: JSON.parse(u.skins || '["default"]')
+    });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'サーバーエラー' });
+  }
+});
+
+app.post('/api/gacha/pull', async (req, res) => {
+  try {
+    const id = requireAuth(req);
+    const result = await pool.query('SELECT coins, gacha_state, skins FROM users WHERE id=$1', [id]);
+    if (result.rows.length === 0) { const e = new Error('ユーザーが見つかりません'); e.status = 404; throw e; }
+    const u = result.rows[0];
+    let coins = Number(u.coins);
+    let gachaState = u.gacha_state || { totalPulls: 0, pityCounter: 0 };
+    let ownedSkins = JSON.parse(u.skins || '["default"]');
+    const hasFreeTicket = (gachaState.freeTickets || 0) > 0;
+    if (!hasFreeTicket && coins < GACHA_COST) { const e = new Error('コインが足りません'); e.status = 400; throw e; }
+
+    if (hasFreeTicket) {
+      gachaState.freeTickets = (gachaState.freeTickets || 0) - 1;
+    } else {
+      coins -= GACHA_COST;
+    }
+    gachaState.totalPulls = (gachaState.totalPulls || 0) + 1;
+    gachaState.pityCounter = (gachaState.pityCounter || 0) + 1;
+
+    const roll = Math.random();
+    const naturalWin = roll < GACHA_RATE_PER_SKIN * GACHA_SKIN_IDS.length;
+    const pityWin = !naturalWin && gachaState.pityCounter >= GACHA_PITY_THRESHOLD;
+    let wonSkinId = (naturalWin || pityWin) ? GACHA_SKIN_IDS[Math.floor(Math.random() * GACHA_SKIN_IDS.length)] : null;
+
+    let resultType = 'miss';
+    let coinsGained = 0;
+    let skinId = null;
+
+    if (wonSkinId) {
+      gachaState.pityCounter = 0;
+      skinId = wonSkinId;
+      if (ownedSkins.includes(wonSkinId)) {
+        resultType = 'duplicate';
+        coinsGained = GACHA_DUPLICATE_COINS;
+        coins += GACHA_DUPLICATE_COINS;
+      } else {
+        resultType = 'win';
+        ownedSkins.push(wonSkinId);
+      }
+    } else {
+      coinsGained = GACHA_MISS_COINS;
+      coins += GACHA_MISS_COINS;
+    }
+
+    await pool.query(
+      'UPDATE users SET coins=$1, gacha_state=$2, skins=$3 WHERE id=$4',
+      [coins, JSON.stringify(gachaState), JSON.stringify(ownedSkins), id]
+    );
+
+    res.json({
+      resultType, skinId, coinsGained, pityTriggered: pityWin, usedFreeTicket: hasFreeTicket,
+      coins, totalPulls: gachaState.totalPulls, pityCounter: gachaState.pityCounter,
+      pityThreshold: GACHA_PITY_THRESHOLD, freeTickets: gachaState.freeTickets || 0, ownedSkins
+    });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'サーバーエラー' });
+  }
+});
+
+// ===================== 🆕 バトルパス(経験値でレベルアップ、報酬はループ、上限なし) =====================
+const BATTLEPASS_XP_PER_LEVEL = 1000; // 1レベルに必要なXP(固定・ループ)
+const BATTLEPASS_CYCLE_LENGTH = 10;   // 報酬パターンが何レベルでループするか
+
+function battlePassRewardForLevel(level) {
+  const cyclePos = ((level - 1) % BATTLEPASS_CYCLE_LENGTH) + 1;
+  const rewards = {
+    1: { type: 'coins', amount: 100 },
+    2: { type: 'coins', amount: 150 },
+    3: { type: 'coins', amount: 200 },
+    4: { type: 'coins', amount: 250 },
+    5: { type: 'gacha_ticket', amount: 1 }, // ガチャを無料で1回引ける
+    6: { type: 'coins', amount: 300 },
+    7: { type: 'coins', amount: 350 },
+    8: { type: 'coins', amount: 400 },
+    9: { type: 'coins', amount: 500 },
+    10: { type: 'gacha_ticket', amount: 1 } // 節目にもう1回
+  };
+  return { level, ...rewards[cyclePos] };
+}
+
+app.get('/api/battlepass/state', async (req, res) => {
+  try {
+    const id = requireAuth(req);
+    const result = await pool.query('SELECT battlepass_xp, battlepass_claimed FROM users WHERE id=$1', [id]);
+    if (result.rows.length === 0) { const e = new Error('ユーザーが見つかりません'); e.status = 404; throw e; }
+    const xp = result.rows[0].battlepass_xp || 0;
+    const claimed = result.rows[0].battlepass_claimed || [];
+    const level = Math.floor(xp / BATTLEPASS_XP_PER_LEVEL) + 1;
+    const xpIntoLevel = xp % BATTLEPASS_XP_PER_LEVEL;
+    const rewards = [];
+    for (let l = 1; l <= level; l++) {
+      rewards.push({ ...battlePassRewardForLevel(l), claimed: claimed.includes(l) });
+    }
+    res.json({ xp, level, xpIntoLevel, xpPerLevel: BATTLEPASS_XP_PER_LEVEL, rewards });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'サーバーエラー' });
+  }
+});
+
+app.post('/api/battlepass/addxp', async (req, res) => {
+  try {
+    const id = requireAuth(req);
+    const { amount } = req.body;
+    const addAmount = Math.max(0, Math.min(5000, parseInt(amount) || 0)); // 1回の加算に上限をかけて不正防止
+    await pool.query('UPDATE users SET battlepass_xp = battlepass_xp + $1 WHERE id = $2', [addAmount, id]);
+    res.json({ ok: true });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'サーバーエラー' });
+  }
+});
+
+app.post('/api/battlepass/claim', async (req, res) => {
+  try {
+    const id = requireAuth(req);
+    const { level } = req.body;
+    const lv = parseInt(level);
+    if (isNaN(lv) || lv < 1) { const e = new Error('レベルを指定してください'); e.status = 400; throw e; }
+    const result = await pool.query('SELECT coins, battlepass_xp, battlepass_claimed, gacha_state FROM users WHERE id=$1', [id]);
+    if (result.rows.length === 0) { const e = new Error('ユーザーが見つかりません'); e.status = 404; throw e; }
+    const u = result.rows[0];
+    const currentLevel = Math.floor((u.battlepass_xp || 0) / BATTLEPASS_XP_PER_LEVEL) + 1;
+    if (lv > currentLevel) { const e = new Error('まだそのレベルに到達していません'); e.status = 400; throw e; }
+    let claimed = u.battlepass_claimed || [];
+    if (claimed.includes(lv)) { const e = new Error('すでに受け取り済みです'); e.status = 400; throw e; }
+    const reward = battlePassRewardForLevel(lv);
+    let coins = Number(u.coins);
+    let gachaState = u.gacha_state || { totalPulls: 0, pityCounter: 0 };
+    let freeTickets = gachaState.freeTickets || 0;
+    if (reward.type === 'coins') {
+      coins += reward.amount;
+    } else if (reward.type === 'gacha_ticket') {
+      freeTickets += reward.amount;
+      gachaState.freeTickets = freeTickets;
+    }
+    claimed.push(lv);
+    await pool.query(
+      'UPDATE users SET coins=$1, battlepass_claimed=$2, gacha_state=$3 WHERE id=$4',
+      [coins, JSON.stringify(claimed), JSON.stringify(gachaState), id]
+    );
+    res.json({ ok: true, reward, coins, freeTickets });
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message || 'サーバーエラー' });
+  }
+});
+
+
 app.get('/api/announcements/latest', async (req, res) => {
   try {
     const result = await pool.query('SELECT id, message, created_at FROM announcements ORDER BY id DESC LIMIT 1');
@@ -561,6 +772,136 @@ async function runEventScheduler() {
   }
 }
 setInterval(runEventScheduler, 60 * 1000);
+
+// ===================== 🆕 週替わりチャレンジ(ランダムな難易度・盤面サイズ、週1回だけ挑戦可) =====================
+function getWeeklyChallengeWeekKey(jstNow) {
+  const d = new Date(jstNow);
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - d.getDay()); // 今週の日曜 00:00
+  const sunday9am = new Date(d);
+  sunday9am.setHours(9, 0, 0, 0);
+  if (jstNow < sunday9am) d.setDate(d.getDate() - 7); // 日曜9:00より前ならまだ前週扱い
+  return jstDateKey(d);
+}
+
+const WEEKLY_CHALLENGE_REWARD = 1500;
+
+async function runWeeklyChallengeScheduler() {
+  try {
+    const jstNow = getJSTNow();
+    const weekKey = getWeeklyChallengeWeekKey(jstNow);
+    const existing = await pool.query('SELECT * FROM weekly_challenge WHERE week_key=$1', [weekKey]);
+    if (existing.rows.length > 0) return; // 今週分は生成済み
+
+    // 前週の1位に報酬を配布
+    const prevChallenge = await pool.query('SELECT * FROM weekly_challenge ORDER BY id DESC LIMIT 1');
+    if (prevChallenge.rows.length > 0) {
+      const prevWeekKey = prevChallenge.rows[0].week_key;
+      const topScore = await pool.query(
+        'SELECT user_id FROM weekly_challenge_scores WHERE week_key=$1 ORDER BY score DESC LIMIT 1',
+        [prevWeekKey]
+      );
+      if (topScore.rows.length > 0) {
+        await pool.query('UPDATE users SET coins = coins + $1 WHERE id = $2', [WEEKLY_CHALLENGE_REWARD, topScore.rows[0].user_id]);
+        console.log(`🎁 週替わりチャレンジ報酬: ${topScore.rows[0].user_id} に${WEEKLY_CHALLENGE_REWARD}コイン`);
+      }
+    }
+
+    // 新しい週のチャレンジをランダム生成
+    const modes = ['soft', 'baked', 'hard', 'extreme'];
+    const randomMode = modes[Math.floor(Math.random() * modes.length)];
+    const randomSize = Math.floor(Math.random() * (18 - 5 + 1)) + 5; // 5〜18
+    await pool.query(
+      'INSERT INTO weekly_challenge (week_key, mode, size) VALUES ($1, $2, $3) ON CONFLICT (week_key) DO NOTHING',
+      [weekKey, randomMode, randomSize]
+    );
+    console.log(`🎲 新しい週替わりチャレンジ: ${randomMode} ${randomSize}×${randomSize} (${weekKey})`);
+  } catch (err) {
+    console.error('週替わりチャレンジスケジューラーエラー:', err.message);
+  }
+}
+setInterval(runWeeklyChallengeScheduler, 60 * 1000);
+runWeeklyChallengeScheduler(); // 起動時に一度実行(未生成なら即生成。initDb完了前に走っても失敗するだけで実害はない)
+
+app.get('/api/weekly-challenge', async (req, res) => {
+  try {
+    const jstNow = getJSTNow();
+    const weekKey = getWeeklyChallengeWeekKey(jstNow);
+    const challengeResult = await pool.query('SELECT * FROM weekly_challenge WHERE week_key=$1', [weekKey]);
+    if (challengeResult.rows.length === 0) return res.json({ challenge: null });
+    const challenge = challengeResult.rows[0];
+
+    const rankingResult = await pool.query(
+      'SELECT user_id, score FROM weekly_challenge_scores WHERE week_key=$1 ORDER BY score DESC LIMIT 10',
+      [weekKey]
+    );
+
+    let myScore = null;
+    const token = req.headers.authorization?.replace('Bearer ', '');
+    if (token) {
+      try {
+        const myId = jwt.verify(token, JWT_SECRET).id;
+        const mine = await pool.query(
+          'SELECT score FROM weekly_challenge_scores WHERE week_key=$1 AND user_id=$2',
+          [weekKey, myId]
+        );
+        if (mine.rows.length > 0) myScore = mine.rows[0].score;
+      } catch (err) { /* 無視 */ }
+    }
+
+    // 次のリセット(次の日曜9:00 JST)までの秒数
+    const [y, m, d] = weekKey.split('-').map(Number);
+    const nextReset = new Date(jstNow);
+    nextReset.setFullYear(y, m - 1, d);
+    nextReset.setDate(nextReset.getDate() + 7);
+    nextReset.setHours(9, 0, 0, 0);
+    const secondsUntilReset = Math.round((nextReset.getTime() - jstNow.getTime()) / 1000);
+
+    res.json({
+      challenge: {
+        weekKey, mode: challenge.mode, size: challenge.size,
+        reward: WEEKLY_CHALLENGE_REWARD, secondsUntilReset
+      },
+      ranking: rankingResult.rows.map(r => ({ id: r.user_id, score: r.score })),
+      myScore,
+      hasPlayed: myScore !== null
+    });
+  } catch (err) {
+    res.status(500).json({ error: '取得に失敗しました' });
+  }
+});
+
+app.post('/api/weekly-challenge/submit', async (req, res) => {
+  try {
+    const id = requireAuth(req);
+    const { score } = req.body;
+    if (typeof score !== 'number' || isNaN(score) || score < 0) {
+      return res.status(400).json({ error: '正しいスコアを送信してください' });
+    }
+    const jstNow = getJSTNow();
+    const weekKey = getWeeklyChallengeWeekKey(jstNow);
+    const challengeResult = await pool.query('SELECT * FROM weekly_challenge WHERE week_key=$1', [weekKey]);
+    if (challengeResult.rows.length === 0) return res.status(400).json({ error: '現在挑戦できるチャレンジがありません' });
+
+    const existing = await pool.query(
+      'SELECT * FROM weekly_challenge_scores WHERE week_key=$1 AND user_id=$2',
+      [weekKey, id]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: '今週はすでに挑戦済みです（1人1回まで）' });
+    }
+    await pool.query(
+      'INSERT INTO weekly_challenge_scores (week_key, user_id, score) VALUES ($1, $2, $3)',
+      [weekKey, id, score]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    if (err.code === '23505') { // UNIQUE制約違反(同時2重送信など)
+      return res.status(400).json({ error: '今週はすでに挑戦済みです（1人1回まで）' });
+    }
+    res.status(500).json({ error: '送信に失敗しました' });
+  }
+});
 
 // ===================== 🆕 ご要望・不具合報告(Discordへ転送) =====================
 function getUserIdFromTokenOptional(req) {
@@ -862,6 +1203,17 @@ app.post('/api/duels/:id/submit-score', async (req, res) => {
     if (d.challenger_score !== null && d.opponent_score !== null && d.status !== 'completed') {
       await pool.query(`UPDATE duels SET status='completed' WHERE id=$1`, [duelId]);
       d.status = 'completed';
+      // 🆕 対決の勝者にコイン報酬を付与(引き分けの場合は両者に少なめの報酬)
+      const DUEL_WIN_REWARD = 200;
+      const DUEL_DRAW_REWARD = 50;
+      if (d.challenger_score > d.opponent_score) {
+        await pool.query('UPDATE users SET coins = coins + $1 WHERE id = $2', [DUEL_WIN_REWARD, d.challenger_id]);
+      } else if (d.opponent_score > d.challenger_score) {
+        await pool.query('UPDATE users SET coins = coins + $1 WHERE id = $2', [DUEL_WIN_REWARD, d.opponent_id]);
+      } else {
+        await pool.query('UPDATE users SET coins = coins + $1 WHERE id = $2', [DUEL_DRAW_REWARD, d.challenger_id]);
+        await pool.query('UPDATE users SET coins = coins + $1 WHERE id = $2', [DUEL_DRAW_REWARD, d.opponent_id]);
+      }
     }
     res.json({ duel: d });
   } catch (err) {
