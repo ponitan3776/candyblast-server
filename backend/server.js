@@ -367,13 +367,13 @@ app.get('/api/sync', async (req, res) => {
   }
 });
 
-// ===================== サーバーお知らせ(管理者コマンドから配信) =====================
+// ===================== サーバーお知らせ(管理者コマンドから配信)=====================
 // ===================== 🆕 ガチャ(限定スキン、低確率、天井あり) =====================
 const GACHA_SKIN_IDS = ['gacha_cosmicdragon', 'gacha_celestialphoenix', 'gacha_voidempress'];
 const GACHA_SKIN_ID_SET = new Set(GACHA_SKIN_IDS);
-const GACHA_COST = 300;
-const GACHA_RATE_PER_SKIN = 0.02; // 1種類あたり2%(3種で合計6%)
-const GACHA_PITY_THRESHOLD = 50;  // 天井: 50回以内に必ず1つ当たる
+const GACHA_COST = 2000;
+const GACHA_RATE_PER_SKIN = 0.005; 
+const GACHA_PITY_THRESHOLD = 500; 
 const GACHA_DUPLICATE_COINS = 500; // 被り時の還元コイン
 const GACHA_MISS_COINS = 30;       // ハズレ時の慰めコイン
 
