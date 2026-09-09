@@ -284,7 +284,10 @@ app.post('/api/sync', async (req, res) => {
     const values = [];
     let paramCount = 1;
 
-    if (size === 8 && mode && bestScore !== undefined) {
+    // 以前は「size===8のときだけ保存」という条件があり、8×8以外の盤面サイズで遊んだ
+    // soft/baked/hardモードのスコアがサーバーに一切保存されていませんでした（重大なバグ）。
+    // ランキングはmode単位で管理しているため、盤面サイズは保存条件に含めないよう修正。
+    if (mode && bestScore !== undefined) {
       const userResult = await pool.query('SELECT best_scores FROM users WHERE id = $1', [id]);
       let bestScores = userResult.rows[0]?.best_scores || {};
       if (!bestScores[mode] || bestScore > bestScores[mode]) {
@@ -367,13 +370,13 @@ app.get('/api/sync', async (req, res) => {
   }
 });
 
-// ===================== サーバーお知らせ(管理者コマンドから配信)=====================
+// ===================== サーバーお知らせ(管理者コマンドから配信) =====================
 // ===================== 🆕 ガチャ(限定スキン、低確率、天井あり) =====================
 const GACHA_SKIN_IDS = ['gacha_cosmicdragon', 'gacha_celestialphoenix', 'gacha_voidempress'];
 const GACHA_SKIN_ID_SET = new Set(GACHA_SKIN_IDS);
-const GACHA_COST = 2000;
-const GACHA_RATE_PER_SKIN = 0.005; 
-const GACHA_PITY_THRESHOLD = 100; 
+const GACHA_COST = 300;
+const GACHA_RATE_PER_SKIN = 0.02; // 1種類あたり2%(3種で合計6%)
+const GACHA_PITY_THRESHOLD = 50;  // 天井: 50回以内に必ず1つ当たる
 const GACHA_DUPLICATE_COINS = 500; // 被り時の還元コイン
 const GACHA_MISS_COINS = 30;       // ハズレ時の慰めコイン
 
@@ -915,13 +918,14 @@ app.post('/api/feedback/request', async (req, res) => {
     const { message } = req.body;
     if (!message || !message.trim()) return res.status(400).json({ error: 'メッセージを入力してください' });
     const userId = getUserIdFromTokenOptional(req);
-    await sendDiscordNotification(
+    const sent = await sendDiscordNotification(
       DISCORD_WEBHOOK_FEATURE_REQUEST,
       '💡 新しいご要望',
       message.trim().slice(0, 3800),
       0xFFD93D,
       [{ name: '送信者', value: userId, inline: true }]
     );
+    if (!sent) return res.status(502).json({ error: 'Discordへの送信に失敗しました。時間をおいて再度お試しください。' });
     res.json({ ok: true });
   } catch (err) {
     console.error('要望送信エラー:', err.message);
@@ -935,22 +939,34 @@ app.post('/api/feedback/report', async (req, res) => {
     if (!message || !message.trim()) return res.status(400).json({ error: 'メッセージを入力してください' });
     const userId = getUserIdFromTokenOptional(req);
     let imageBuffer = null;
+    let imageMimeType = 'image/png';
+    let imageExt = 'png';
     if (imageBase64) {
-      const base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, '');
+      const match = imageBase64.match(/^data:(image\/(\w+));base64,(.+)$/);
+      let base64Data;
+      if (match) {
+        imageMimeType = match[1];
+        imageExt = match[2] === 'jpeg' ? 'jpg' : match[2];
+        base64Data = match[3];
+      } else {
+        base64Data = imageBase64.replace(/^data:image\/\w+;base64,/, '');
+      }
       imageBuffer = Buffer.from(base64Data, 'base64');
       if (imageBuffer.length > 8 * 1024 * 1024) {
         return res.status(400).json({ error: '画像サイズが大きすぎます（8MBまで）' });
       }
     }
-    await sendDiscordNotification(
+    const sent = await sendDiscordNotification(
       DISCORD_WEBHOOK_BUG_REPORT,
       '🐞 不具合の報告',
       message.trim().slice(0, 3800),
       0xFF5555,
       [{ name: '報告者', value: userId, inline: true }],
       imageBuffer,
-      'report.png'
+      `report.${imageExt}`,
+      imageMimeType
     );
+    if (!sent) return res.status(502).json({ error: 'Discordへの送信に失敗しました。時間をおいて再度お試しください。' });
     res.json({ ok: true });
   } catch (err) {
     console.error('報告送信エラー:', err.message);
