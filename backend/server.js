@@ -333,12 +333,25 @@ app.post('/api/sync', async (req, res) => {
     }
 
     if (updateFields.length === 0) {
-      return res.json({ success: true });
+      const currentRow = await pool.query('SELECT best_scores, coins FROM users WHERE id = $1', [id]);
+      return res.json({
+        success: true,
+        bestScores: currentRow.rows[0]?.best_scores || {},
+        coins: Number(currentRow.rows[0]?.coins || 0)
+      });
     }
     values.push(id);
     const query = `UPDATE users SET ${updateFields.join(', ')} WHERE id = $${paramCount}`;
     await pool.query(query, values);
-    res.json({ success: true });
+    // 更新後の「正しい」値を返し、クライアントが自分の楽観的な予測ではなく
+    // サーバー側の確定値で表示を上書きできるようにする
+    // (管理者コマンドで書き換えられた直後などに、古いローカル値のまま表示され続けるのを防ぐ)
+    const freshRow = await pool.query('SELECT best_scores, coins FROM users WHERE id = $1', [id]);
+    res.json({
+      success: true,
+      bestScores: freshRow.rows[0]?.best_scores || {},
+      coins: Number(freshRow.rows[0]?.coins || 0)
+    });
   } catch (err) {
     console.error(err);
     res.status(401).json({ error: '認証エラー' });
